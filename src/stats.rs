@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 失败样例条数上限。
 pub const MAX_FAILURE_EXAMPLES: usize = 32;
@@ -119,68 +119,6 @@ impl Stats {
     }
 }
 
-/// 1 秒滑窗的指数加权速度计。
-pub struct SpeedMeter {
-    last_bytes: u64,
-    last_at: Instant,
-    ema: f64,
-    initialized: bool,
-}
-
-impl SpeedMeter {
-    pub fn new() -> Self {
-        Self {
-            last_bytes: 0,
-            last_at: Instant::now(),
-            ema: 0.0,
-            initialized: false,
-        }
-    }
-
-    /// 重置基线：换阶段时调用，避免把上一阶段的时长计入第一次采样。
-    pub fn reset(&mut self, total_bytes: u64, now: Instant) {
-        self.last_bytes = total_bytes;
-        self.last_at = now;
-        self.ema = 0.0;
-        self.initialized = false;
-    }
-
-    /// 采样一次累计字节数，返回当前速度（字节每秒）。
-    pub fn sample(&mut self, total_bytes: u64, now: Instant) -> f64 {
-        let elapsed = now.saturating_duration_since(self.last_at).as_secs_f64();
-        if elapsed < 0.05 {
-            return self.ema;
-        }
-        let delta = total_bytes.saturating_sub(self.last_bytes) as f64;
-        if delta == 0.0 {
-            // 没有新字节时不把这个 0 计入 EMA，避免结束时速度被拉低。
-            self.last_at = now;
-            return self.ema;
-        }
-        let instant = delta / elapsed;
-        self.last_bytes = total_bytes;
-        self.last_at = now;
-        if !self.initialized {
-            self.ema = instant;
-            self.initialized = true;
-        } else {
-            // 约 1 秒窗口的 EMA（每次采样间隔约 100 ms）。
-            self.ema = 0.7 * self.ema + 0.3 * instant;
-        }
-        self.ema
-    }
-
-    pub fn speed(&self) -> f64 {
-        self.ema
-    }
-}
-
-impl Default for SpeedMeter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// 二进制前缀单位。
 pub const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
@@ -205,18 +143,6 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// 速率同样拆成数值与单位。
-pub fn speed_parts(bytes_per_sec: f64) -> (f64, &'static str) {
-    human_bytes_parts(bytes_per_sec.max(0.0).round() as u64)
-}
-
-pub fn human_speed(bytes_per_sec: f64) -> String {
-    if bytes_per_sec <= 0.0 {
-        return "0 B/s".to_string();
-    }
-    format!("{}/s", human_bytes(bytes_per_sec.round() as u64))
-}
-
 /// 把秒数格式化为 mm:ss 或 hh:mm:ss。
 pub fn human_duration(seconds: u64) -> String {
     let s = seconds % 60;
@@ -227,14 +153,6 @@ pub fn human_duration(seconds: u64) -> String {
     } else {
         format!("{m:02}:{s:02}")
     }
-}
-
-/// 按速度估算剩余时间。
-pub fn eta_seconds(remaining_bytes: u64, bytes_per_sec: f64) -> Option<u64> {
-    if bytes_per_sec < 64.0 * 1024.0 {
-        return None;
-    }
-    Some((remaining_bytes as f64 / bytes_per_sec).ceil() as u64)
 }
 
 pub fn elapsed(seconds: f64) -> Duration {
@@ -267,30 +185,10 @@ mod tests {
     }
 
     #[test]
-    fn speed_meter_converges() {
-        let mut meter = SpeedMeter::new();
-        let start = Instant::now();
-        let mut total = 0u64;
-        for step in 1..=10u64 {
-            total += 1024 * 1024;
-            let now = start + Duration::from_millis(100 * step);
-            meter.sample(total, now);
-        }
-        let speed = meter.speed();
-        // 每 100 ms 累计 1 MiB，即约 10 MiB/s。
-        assert!(
-            (9_000_000.0..=11_000_000.0).contains(&speed),
-            "速度应接近 10 MiB/s，实际 {speed}"
-        );
-    }
-
-    #[test]
     fn human_units() {
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_duration(65), "01:05");
         assert_eq!(human_duration(3725), "01:02:05");
-        assert_eq!(eta_seconds(1_000_000, 1000.0), None);
-        assert_eq!(eta_seconds(1_000_000, 500_000.0), Some(2));
     }
 }

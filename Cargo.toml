@@ -1,6 +1,6 @@
 [package]
 name = "rustcopycardapp"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
 description = "相机存储卡复制工具：四阶段复制、XXH64 校验、tmp 原子提交"
 license = "MIT"

@@ -70,10 +70,6 @@ pub struct Cli {
     /// 进度行的颜色策略（默认按 NO_COLOR、TERM 与 TTY 判断）
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
     pub color: ColorChoice,
-
-    /// 进度行只用 ASCII 字形（终端不支持 UTF-8 或需要记录纯文本时使用）
-    #[arg(long)]
-    pub ascii: bool,
 }
 
 #[cfg(test)]
@@ -84,7 +80,6 @@ mod tests {
     fn cli_parses_defaults() {
         let cli = Cli::try_parse_from(["rcca", "src", "dst"]).unwrap();
         assert_eq!(cli.color, ColorChoice::Auto);
-        assert!(!cli.ascii);
         assert!(!cli.keep_source_name);
         assert!(!cli.skip_unreadable);
         assert!(!cli.fail_fast);
@@ -93,11 +88,9 @@ mod tests {
     }
 
     #[test]
-    fn color_and_ascii_flags_parse() {
-        let cli =
-            Cli::try_parse_from(["rcca", "src", "dst", "--color", "never", "--ascii"]).unwrap();
+    fn color_flag_parses() {
+        let cli = Cli::try_parse_from(["rcca", "src", "dst", "--color", "never"]).unwrap();
         assert_eq!(cli.color, ColorChoice::Never);
-        assert!(cli.ascii);
         assert!(Cli::try_parse_from(["rcca", "src", "dst", "--color", "sometimes"]).is_err());
     }
 

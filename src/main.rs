@@ -8,14 +8,14 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use rcca::cli::{Cli, ColorChoice};
+use rcca::cli::Cli;
 use rcca::engine::{self, Options as EngineOptions};
 use rcca::error::{Error, Result};
 use rcca::paths;
 use rcca::report::{self, Summary};
 use rcca::scan;
 use rcca::stats::{human_bytes, Stats};
-use rcca::ui::{CopyLine, CopySlot, Phase, Ui};
+use rcca::ui::{self, Phase, ProgressLine, ProgressSlot};
 use rcca::verify;
 
 /// 校验阶段每次读取的块大小。
@@ -36,7 +36,10 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let started = Instant::now();
     let stats = Arc::new(Stats::new());
-    let mut ui = Ui::new(cli.quiet, color_enabled(cli.color), ascii_output(cli.ascii));
+    let style = ui::Style {
+        color: ui::color_enabled(cli.color),
+    };
+    let progress_enabled = ui::interactive(cli.quiet);
 
     // ---------- 阶段 1：参数与卷预检 ----------
     let source = fs::canonicalize(&cli.source).map_err(|err| {
@@ -148,7 +151,6 @@ fn run(cli: Cli) -> Result<i32> {
     }
 
     if manifest.files.is_empty() {
-        ui.finish();
         let summary = Summary {
             source: source.clone(),
             target: target_root.clone(),
@@ -186,7 +188,7 @@ fn run(cli: Cli) -> Result<i32> {
     };
 
     // 复制阶段只报当前文件：sy 不打印任何进度，这一行由 rcca 原地刷新。
-    let copy_slot = CopySlot::default();
+    let copy_slot = ProgressSlot::default();
     {
         let slot = copy_slot.clone();
         engine::set_file_observer(move |path| {
@@ -195,7 +197,8 @@ fn run(cli: Cli) -> Result<i32> {
             }
         });
     }
-    let mut copy_line = CopyLine::start(copy_slot, ui.active(), ui.style());
+    let mut copy_line =
+        ProgressLine::start(Phase::Copy.label(), copy_slot, progress_enabled, style);
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
     copy_line.finish();
 
@@ -222,9 +225,6 @@ fn run(cli: Cli) -> Result<i32> {
     // ---------- 阶段 4：rcca 遍历并逐文件 XXH64 校验 ----------
     // 复制阶段不拦截 Ctrl-C（交给内嵌 sy 自行结束），校验阶段才接管。
     install_signal_handler(&stats);
-    ui.set_copy_totals(manifest.files.len() as u64, manifest.total_bytes);
-    ui.set_total_bytes(manifest.total_bytes);
-    ui.set_phase(Phase::Verify, manifest.files.len() as u64);
 
     let indices: Vec<usize> = (0..manifest.files.len()).collect();
     let verify_opts = verify::Options {
@@ -232,8 +232,15 @@ fn run(cli: Cli) -> Result<i32> {
         keep_bad: cli.keep_bad,
         no_cache: cli.verify_no_cache,
     };
+    let verify_slot = ProgressSlot::default();
+    let mut verify_line = ProgressLine::start(
+        Phase::Verify.label(),
+        verify_slot.clone(),
+        progress_enabled,
+        style,
+    );
     let verify_report = {
-        let mut tick = |stats: &Stats| ui.tick(stats);
+        let mut tick = |stats: &Stats| verify_slot.set(stats.current());
         verify::run(
             &manifest.files,
             &indices,
@@ -244,14 +251,12 @@ fn run(cli: Cli) -> Result<i32> {
             &mut tick,
         )
     };
-    ui.set_progress((verify_report.matched + verify_report.mismatched.len()) as u64);
-    ui.tick_force(&stats);
+    verify_line.finish();
 
     let interrupted = stats.cancel.load(Ordering::SeqCst);
     if interrupted {
         stats.note_failure("校验阶段被中断".to_string());
     }
-    ui.finish();
 
     // ---------- 汇总 ----------
     let mut failures = stats.failure_examples();
@@ -297,29 +302,6 @@ fn run(cli: Cli) -> Result<i32> {
     } else {
         Ok(1)
     }
-}
-
-/// 颜色策略：显式开关优先，其次 NO_COLOR、TERM=dumb 与非 TTY。
-fn color_enabled(choice: ColorChoice) -> bool {
-    match choice {
-        ColorChoice::Always => true,
-        ColorChoice::Never => false,
-        ColorChoice::Auto => {
-            if std::env::var_os("NO_COLOR").is_some() {
-                return false;
-            }
-            if matches!(std::env::var("TERM").as_deref(), Ok("dumb")) {
-                return false;
-            }
-            std::io::IsTerminal::is_terminal(&std::io::stderr())
-        }
-    }
-}
-
-/// 是否只能用 ASCII 字形：显式开关或 TERM=dumb。不猜本地化环境——多数终端是 UTF-8，
-/// 但 LANG 常为空，按 locale 判断会误回退。
-fn ascii_output(flag: bool) -> bool {
-    flag || matches!(std::env::var("TERM").as_deref(), Ok("dumb"))
 }
 
 fn install_signal_handler(stats: &Arc<Stats>) {
