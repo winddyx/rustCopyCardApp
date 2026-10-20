@@ -1,0 +1,34 @@
+[package]
+name = "rustcopycardapp"
+version = "1.0.0"
+edition = "2021"
+description = "相机存储卡复制工具：四阶段复制、XXH64 校验、tmp 原子提交"
+license = "MIT"
+
+[lib]
+name = "rcca"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rcca"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+filetime = "0.2"
+libc = "0.2"
+terminal_size = "0.4"
+thiserror = "2"
+unicode-width = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
