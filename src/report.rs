@@ -50,8 +50,9 @@ pub fn render(summary: &Summary) -> Vec<String> {
         human_duration(summary.elapsed.as_secs())
     ));
 
+    // sy 的计数包含目录条目，这里按它的口径标注，避免与上面的文件数混淆。
     lines.push(format!(
-        "复制（sy）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
+        "复制（sy，含目录计数）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
         summary.created,
         summary.updated,
         summary.skipped,
@@ -123,6 +124,17 @@ mod tests {
             verbose: false,
             interrupted: false,
         }
+    }
+
+    #[test]
+    fn copy_line_marks_sy_counting_includes_directories() {
+        let lines = render(&base());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("复制（sy，含目录计数）：新建 2 个")),
+            "{lines:?}"
+        );
     }
 
     #[test]

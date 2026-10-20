@@ -144,6 +144,11 @@ impl SpeedMeter {
             return self.ema;
         }
         let delta = total_bytes.saturating_sub(self.last_bytes) as f64;
+        if delta == 0.0 {
+            // 没有新字节时不把这个 0 计入 EMA，避免结束时速度被拉低。
+            self.last_at = now;
+            return self.ema;
+        }
         let instant = delta / elapsed;
         self.last_bytes = total_bytes;
         self.last_at = now;

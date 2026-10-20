@@ -5,9 +5,8 @@
 
 use std::path::Path;
 
-use sy::path::SyncPath;
-use sy::sync::session::{EndpointPair, SyncSession};
-use sy::sync::{DeleteMode, SyncConfig, SyncStats};
+use sy::sync::{DeleteMode, SyncConfig, SyncEngine, SyncStats};
+use sy::transport::local::LocalTransport;
 
 use crate::error::{Error, Result};
 
@@ -59,23 +58,14 @@ pub fn copy_tree(source: &Path, target: &Path, opts: &Options) -> Result<SyncSta
         config.max_errors = limit;
     }
 
-    // 源路径带结尾斜杠：表示复制目录内容而不是目录本身。
-    let source_path = SyncPath::parse(&format!("{}/", source.display()));
-    let target_path = SyncPath::parse(&target.display().to_string());
-
-    let src = EndpointPair::from_sync_path(&source_path)
-        .map_err(|err| Error::copy(format!("无法解析源路径：{err}")))?;
-    let dst = EndpointPair::from_sync_path(&target_path)
-        .map_err(|err| Error::copy(format!("无法解析目标路径：{err}")))?;
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| Error::copy(format!("无法创建异步运行时：{err}")))?;
 
-    let session = SyncSession::new(src, dst, config);
+    let engine = SyncEngine::with_config(LocalTransport::new(), config);
     runtime
-        .block_on(session.sync())
+        .block_on(engine.sync(source, target))
         .map_err(|err| Error::copy(format!("sy：{err}")))
 }
 

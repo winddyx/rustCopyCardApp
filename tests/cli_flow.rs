@@ -79,7 +79,7 @@ fn copies_tree_and_verifies() {
         stdout.contains("校验（XXH64）：通过 4 个"),
         "输出：{stdout}"
     );
-    assert!(stdout.contains("复制（sy）：新建 4 个"), "输出：{stdout}");
+    assert!(stdout.contains("复制（sy，含目录计数）"), "输出：{stdout}");
     assert!(stdout.contains("全部文件已复制"), "输出：{stdout}");
 }
 
