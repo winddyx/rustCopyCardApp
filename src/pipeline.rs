@@ -328,13 +328,11 @@ fn writer_loop(
                     if outcome.is_ok() {
                         eio_streak = 0;
                     } else if kind == Some(io::ErrorKind::PermissionDenied)
-                        || raw == Some(libc::ENOSPC)
-                        || raw == Some(libc::EROFS)
-                        || raw == Some(libc::EDQUOT)
+                        || crate::platform::is_disk_full(raw)
                     {
                         // 权限与空间问题几乎不会自行恢复，直接中止。
                         stats.request_abort("目标卷不可写或空间不足");
-                    } else if raw == Some(libc::EIO) {
+                    } else if crate::platform::is_device_io_error(raw) {
                         eio_streak += 1;
                         if eio_streak >= 3 {
                             stats.request_abort("连续 IO 错误，设备可能已断开");
@@ -463,9 +461,7 @@ fn run_serial(
         }
         let raw = active.error_raw();
         let outcome = active.finish(opts.fsync, mode, mtime, read_error);
-        if !outcome.is_ok()
-            && (raw == Some(libc::ENOSPC) || raw == Some(libc::EROFS) || raw == Some(libc::EDQUOT))
-        {
+        if !outcome.is_ok() && crate::platform::is_disk_full(raw) {
             stats.request_abort("目标卷不可写或空间不足");
         }
         notify(opts, index, &outcome);

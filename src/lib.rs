@@ -8,6 +8,7 @@ pub mod copy;
 pub mod error;
 pub mod paths;
 pub mod pipeline;
+pub mod platform;
 pub mod report;
 pub mod scan;
 pub mod stats;

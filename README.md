@@ -5,8 +5,19 @@
 ## 构建
 
 ```bash
-cargo build --release        # 产物：target/release/rcca（Windows 为 rcca.exe）
+make dist               # 发行构建：先删除 dist/，再构建两个平台并生成校验和
+cargo build --release   # 只构建当前平台，产物 target/release/rcca
 ```
+
+`make dist` 的产物：
+
+- `dist/rcca-macos-arm64`：macOS arm64 可执行文件。
+- `dist/rcca-windows-x64.exe`：Windows x64 可执行文件（PE32+，仅依赖系统 DLL）。
+- `dist/SHA256SUMS`：两个产物的 SHA-256，校验用 `cd dist && shasum -a 256 -c SHA256SUMS`。
+
+交叉编译 Windows 需要 `rustup target add x86_64-pc-windows-gnu` 与 `brew install mingw-w64`；`make dist` 内部调用 `cargo build --release --target`，先删除 `dist/` 再完整重建，不保留旧产物。
+
+其他入口：`make test` 运行全部测试，`make lint` 执行 clippy 与格式检查，`make clean` 清理 `target/` 与 `dist/`。
 
 ## 用法
 
@@ -52,7 +63,7 @@ rcca <source> <target> [OPTIONS]
 ## 测试
 
 ```bash
-cargo test                                        # 56 个测试（37 单元 + 19 集成）
+cargo test                                        # 57 个测试（38 单元 + 19 集成）
 cargo clippy --all-targets -- -D warnings
 ```
 

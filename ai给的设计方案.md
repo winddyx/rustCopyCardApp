@@ -410,9 +410,9 @@ IO 抽象：最小化的 `trait Io`（read / write / rename / fsync / stat），
 
 ## 16. 实现与实测记录（v1.0.0）
 
-代码规模：`src/` 约 3500 行（11 个模块加入口），`tests/` 约 440 行。依赖与第 13 节一致，未引入 tokio、rayon、walkdir。
+代码规模：`src/` 约 3560 行（12 个模块加入口），`tests/` 约 440 行。依赖与第 13 节一致，未引入 tokio、rayon、walkdir。
 
-测试：37 个单元测试加 19 个集成测试，全部通过；`cargo clippy --all-targets -- -D warnings` 无告警；`cargo build --release` 产物 1.1 MB。
+测试：38 个单元测试加 19 个集成测试，全部通过；`cargo clippy --all-targets -- -D warnings` 无告警；`cargo build --release` 产物 1.1 MB。
 
 实测（macOS arm64，APFS，780 MiB 素材、202 个文件）：
 
