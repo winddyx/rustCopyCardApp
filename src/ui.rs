@@ -1,4 +1,4 @@
-//! 四行自适应终端界面：百分比与当前文件、校验计数与时间、阶段与进度、速率。
+//! 三行自适应终端界面：百分比与当前文件、校验计数与时间、阶段与进度（含速率）。
 //!
 //! 复制阶段由内嵌的 sy 直接输出，本界面只在校验阶段绘制。
 //!
@@ -125,7 +125,6 @@ pub fn render(snapshot: &Snapshot, width: usize) -> Vec<String> {
         render_head_line(snapshot, width),
         render_counters_line(snapshot, width),
         render_phase_line(snapshot, width),
-        render_io_line(snapshot, width),
     ]
 }
 
@@ -161,7 +160,7 @@ fn render_counters_line(snapshot: &Snapshot, width: usize) -> String {
     build_row(cells, width)
 }
 
-/// 第三行：阶段名、文件计数、字节进度。
+/// 第三行：阶段名、文件计数、字节进度与读取速率。
 fn render_phase_line(snapshot: &Snapshot, width: usize) -> String {
     let counts = if snapshot.files_total > 0 {
         format!("{}/{} files", snapshot.files_done, snapshot.files_total)
@@ -183,24 +182,15 @@ fn render_phase_line(snapshot: &Snapshot, width: usize) -> String {
             23,
             60,
         ));
-    }
-    build_row(cells, width)
-}
-
-/// 第四行：读取速率（哈希从两侧读数据）。
-fn render_io_line(snapshot: &Snapshot, width: usize) -> String {
-    if !matches!(snapshot.phase, Phase::Copy | Phase::Verify) {
-        return String::new();
-    }
-    let (read_value, read_unit) = speed_parts(snapshot.read_speed);
-    build_row(
-        vec![Cell::left(
+        // 速率与字节进度同一行，宽度不足时先丢它。
+        let (read_value, read_unit) = speed_parts(snapshot.read_speed);
+        cells.push(Cell::left(
             format!("R {read_value:.1} {read_unit}/s"),
             15,
             40,
-        )],
-        width,
-    )
+        ));
+    }
+    build_row(cells, width)
 }
 
 fn truncate_end(s: &str, max_width: usize) -> String {
@@ -480,14 +470,18 @@ mod tests {
     #[test]
     fn renders_percent_and_file_on_first_line() {
         let lines = render(&snapshot(Phase::Verify, 0.5), 120);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], " 50.0%  >  C7463.MP4");
         assert!(lines[1].starts_with("match "));
         assert!(lines[1].contains("mismatch "));
         assert!(lines[1].contains("ETA"));
         assert!(lines[2].starts_with("VRFY"));
         assert!(lines[2].contains("GiB"));
-        assert!(lines[3].starts_with("R "));
+        assert!(
+            lines[2].contains("R "),
+            "速率与字节进度同一行：{}",
+            lines[2]
+        );
     }
 
     #[test]
@@ -563,6 +557,10 @@ mod tests {
 
         let mid = render(&snapshot(Phase::Verify, 0.5), 40).join("\n");
         assert!(!mid.contains("ETA"), "宽度不足时先丢 ETA：{mid}");
+        assert!(mid.contains("VRFY"), "阶段名最后保留：{mid}");
+
+        let speed = render(&snapshot(Phase::Verify, 0.5), 30).join("\n");
+        assert!(!speed.contains("R "), "窄终端先丢速率：{speed}");
 
         let tiny = render(&snapshot(Phase::Verify, 0.5), 20).join("\n");
         assert!(tiny.contains('%'));
@@ -573,7 +571,7 @@ mod tests {
     fn every_line_fits_the_width() {
         for width in [20usize, 30, 44, 60, 72, 90, 110, 200] {
             let lines = render(&snapshot(Phase::Verify, 0.42), width);
-            assert_eq!(lines.len(), 4);
+            assert_eq!(lines.len(), 3);
             for line in lines {
                 assert!(
                     line.width() <= width,
@@ -585,10 +583,14 @@ mod tests {
     }
 
     #[test]
-    fn io_line_is_empty_outside_io_phases() {
+    fn speed_is_absent_outside_io_phases() {
         let lines = render(&snapshot(Phase::Scan, 0.0), 100);
-        assert_eq!(lines[3], "");
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            !lines[2].contains("R "),
+            "扫描阶段没有字节与速率：{}",
+            lines[2]
+        );
     }
 
     #[test]

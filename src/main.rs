@@ -192,9 +192,10 @@ fn run(cli: Cli) -> Result<i32> {
         // 再补一行中文结果与空行，使校验界面从干净的一行开始。
         println!();
         println!(
-            "rcca: 复制完成（sy）：新建 {} 个，更新 {} 个，删除 {} 个，传输 {}",
+            "rcca: 复制完成（sy）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
             copy.files_created,
             copy.files_updated,
+            copy.files_skipped,
             copy.files_deleted,
             human_bytes(copy.bytes_transferred)
         );
