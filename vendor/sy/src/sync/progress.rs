@@ -18,6 +18,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// rcca 补丁：逐文件进度条开关。总体进度线已经提供字节、速率与 ETA，
+/// 逐文件进度条只会互相覆盖，默认关闭。
+const PER_FILE_PROGRESS: bool = false;
+
 /// Minimum file size (in bytes) to show progress bar
 /// Files smaller than this are transferred too quickly for meaningful progress display
 pub const MIN_SIZE_FOR_PROGRESS: u64 = 1024 * 1024; // 1MB
@@ -26,6 +30,13 @@ pub const MIN_SIZE_FOR_PROGRESS: u64 = 1024 * 1024; // 1MB
 ///
 /// Returns Arc-wrapped progress bar that can be shared with the callback
 pub fn create_file_progress_bar(file_path: &Path, total_bytes: u64) -> Arc<ProgressBar> {
+    // rcca 补丁：逐文件进度条与总体进度条各自重绘，在终端宽度有限时会互相覆盖、换行错乱，
+    // 因此这里统一返回隐藏的进度条，只保留 SyncEngine 的总体进度线。
+    if !PER_FILE_PROGRESS {
+        let _ = (file_path, total_bytes);
+        return Arc::new(ProgressBar::hidden());
+    }
+
     let pb = ProgressBar::new(total_bytes);
 
     // Format: filename [=====>] 45.2 MB/100 MB (45%) 12 MB/s ETA: 4s
