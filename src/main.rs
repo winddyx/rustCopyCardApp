@@ -187,6 +187,19 @@ fn run(cli: Cli) -> Result<i32> {
         max_errors: cli.fail_fast.then_some(1),
     };
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
+    if !cli.quiet {
+        // sy 的进度条以 finish_with_message 收尾，不会补换行，先断开它的最后一行，
+        // 再补一行中文结果与空行，使校验界面从干净的一行开始。
+        println!();
+        println!(
+            "rcca: 复制完成（sy）：新建 {} 个，更新 {} 个，删除 {} 个，传输 {}",
+            copy.files_created,
+            copy.files_updated,
+            copy.files_deleted,
+            human_bytes(copy.bytes_transferred)
+        );
+        println!();
+    }
     for err in &copy.errors {
         stats.note_failure(format!(
             "复制 {}：{}（{}）",

@@ -70,18 +70,12 @@ pub struct Snapshot {
     pub verify_bad: u64,
 }
 
-/// 单元格对齐方式。
-#[derive(Clone, Copy)]
-enum Align {
-    Left,
-    Right,
-}
-
 /// 固定宽度的表格单元格：列位置不随内容长度变化，内容超长时在单元格内截断。
+///
+/// 文本左对齐，因此标签与数值之间没有多余空隙；宽度固定使位数增长不会推动后续列。
 struct Cell {
     text: String,
     width: usize,
-    align: Align,
     /// 宽度不足时优先丢弃优先级低的列。
     priority: u8,
 }
@@ -91,16 +85,6 @@ impl Cell {
         Self {
             text,
             width,
-            align: Align::Left,
-            priority,
-        }
-    }
-
-    fn right(text: String, width: usize, priority: u8) -> Self {
-        Self {
-            text,
-            width,
-            align: Align::Right,
             priority,
         }
     }
@@ -110,10 +94,7 @@ impl Cell {
 fn fit_cell(cell: &Cell) -> String {
     let truncated = truncate_end(&cell.text, cell.width);
     let pad = cell.width.saturating_sub(truncated.width());
-    match cell.align {
-        Align::Left => format!("{truncated}{}", " ".repeat(pad)),
-        Align::Right => format!("{}{truncated}", " ".repeat(pad)),
-    }
+    format!("{truncated}{}", " ".repeat(pad))
 }
 
 /// 依次拼接单元格；宽度不足时按优先级丢弃整列，仍超宽则整行截断。
@@ -156,26 +137,24 @@ fn render_head_line(snapshot: &Snapshot, width: usize) -> String {
 }
 
 /// 第二行：校验的匹配与不一致计数、已用时间与 ETA。
+///
+/// 数值一律左对齐：标签紧跟数值，没有多余缩进；列宽固定，位数增加也不会移动后面的列。
 fn render_counters_line(snapshot: &Snapshot, width: usize) -> String {
-    let elapsed = format!("elapsed {:>9}", human_duration(snapshot.elapsed.as_secs()));
+    let elapsed = format!("elapsed {}", human_duration(snapshot.elapsed.as_secs()));
     let eta = snapshot
         .eta
-        .map(|seconds| format!("ETA {:>8}", human_duration(seconds)));
+        .map(|seconds| format!("ETA {}", human_duration(seconds)));
 
     let mut cells = Vec::new();
     if snapshot.phase == Phase::Verify {
+        cells.push(Cell::left(format!("match {}", snapshot.verify_ok), 11, 100));
         cells.push(Cell::left(
-            format!("match {:>6}", snapshot.verify_ok),
-            12,
-            100,
-        ));
-        cells.push(Cell::left(
-            format!("mismatch {:>6}", snapshot.verify_bad),
-            15,
+            format!("mismatch {}", snapshot.verify_bad),
+            14,
             100,
         ));
     }
-    cells.push(Cell::left(elapsed, 17, 60));
+    cells.push(Cell::left(elapsed, 16, 60));
     if let Some(eta) = eta {
         cells.push(Cell::left(eta, 12, 40));
     }
@@ -192,16 +171,16 @@ fn render_phase_line(snapshot: &Snapshot, width: usize) -> String {
 
     let mut cells = vec![
         Cell::left(snapshot.phase.label().to_string(), 4, 100),
-        Cell::right(counts, 20, 80),
+        Cell::left(counts, 17, 80),
     ];
     if matches!(snapshot.phase, Phase::Copy | Phase::Verify) {
-        cells.push(Cell::right(
+        cells.push(Cell::left(
             format!(
                 "{}/{}",
                 human_bytes(snapshot.bytes_done),
                 human_bytes(snapshot.bytes_total)
             ),
-            19,
+            23,
             60,
         ));
     }
@@ -216,8 +195,8 @@ fn render_io_line(snapshot: &Snapshot, width: usize) -> String {
     let (read_value, read_unit) = speed_parts(snapshot.read_speed);
     build_row(
         vec![Cell::left(
-            format!("R {read_value:>6.1} {read_unit:>3}/s"),
-            14,
+            format!("R {read_value:.1} {read_unit}/s"),
+            15,
             40,
         )],
         width,
@@ -278,6 +257,8 @@ pub struct Ui {
     files_done: u64,
     enabled: bool,
     last_current: String,
+    /// 每次换阶段后的第一次采样只重建速率基线，不参与平均。
+    meter_needs_reset: bool,
 }
 
 impl Ui {
@@ -295,6 +276,7 @@ impl Ui {
             files_done: 0,
             enabled: interactive,
             last_current: String::new(),
+            meter_needs_reset: true,
         }
     }
 
@@ -307,6 +289,7 @@ impl Ui {
         self.phase = phase;
         self.files_total = files_total;
         self.files_done = 0;
+        self.meter_needs_reset = true;
         self.last_draw = Instant::now() - Duration::from_secs(1);
     }
 
@@ -337,10 +320,13 @@ impl Ui {
         self.last_draw = now;
         self.last_current = stats.current();
 
-        let read_speed = self.read_meter.sample(
-            stats.read_bytes.load(std::sync::atomic::Ordering::Relaxed),
-            now,
-        );
+        let read_bytes = stats.read_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if self.meter_needs_reset {
+            // 上一阶段的读数与间隔不属于本阶段，先重建基线再开始测速。
+            self.read_meter.reset(read_bytes, now);
+            self.meter_needs_reset = false;
+        }
+        let read_speed = self.read_meter.sample(read_bytes, now);
 
         let hashed = stats
             .hashed_bytes
@@ -520,29 +506,41 @@ mod tests {
         small.verify_ok = 9;
         small.files_done = 9;
         let mut large = small.clone_shallow();
-        large.verify_ok = 123456;
-        large.verify_bad = 654321;
-        large.files_done = 123456;
-        large.files_total = 654321;
+        large.verify_ok = 12345;
+        large.verify_bad = 6789;
+        large.files_done = 12345;
+        large.files_total = 54321;
         large.elapsed = Duration::from_secs(3 * 3600 + 65);
 
         let small_lines = render(&small, 120);
         let large_lines = render(&large, 120);
 
+        // 用显示宽度比较列位置：`…` 是 3 字节宽 1 列的字符，字节下标会误导。
+        let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].width();
         assert_eq!(
-            small_lines[1].find("mismatch"),
-            large_lines[1].find("mismatch"),
+            column(&small_lines[1], "mismatch"),
+            column(&large_lines[1], "mismatch"),
             "mismatch 列位置不应移动"
+        );
+        assert_eq!(
+            column(&small_lines[1], "elapsed"),
+            column(&large_lines[1], "elapsed"),
+            "elapsed 列位置不应移动"
+        );
+        assert_eq!(
+            column(&small_lines[2], "GiB"),
+            column(&large_lines[2], "GiB"),
+            "字节进度列位置不应移动"
         );
         assert_eq!(
             small_lines[1].width(),
             large_lines[1].width(),
-            "计数行宽度应固定"
+            "计数行宽度固定"
         );
         assert_eq!(
             small_lines[2].width(),
             large_lines[2].width(),
-            "阶段行宽度应固定"
+            "阶段行宽度固定"
         );
     }
 

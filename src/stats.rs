@@ -137,6 +137,14 @@ impl SpeedMeter {
         }
     }
 
+    /// 重置基线：换阶段时调用，避免把上一阶段的时长计入第一次采样。
+    pub fn reset(&mut self, total_bytes: u64, now: Instant) {
+        self.last_bytes = total_bytes;
+        self.last_at = now;
+        self.ema = 0.0;
+        self.initialized = false;
+    }
+
     /// 采样一次累计字节数，返回当前速度（字节每秒）。
     pub fn sample(&mut self, total_bytes: u64, now: Instant) -> f64 {
         let elapsed = now.saturating_duration_since(self.last_at).as_secs_f64();
