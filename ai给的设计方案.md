@@ -1,6 +1,10 @@
-# rustcopyapp 设计方案
+# rustCopyCardApp 设计方案
 
 应用场景：把相机存储卡（SD / CFexpress，通常为 exFAT 或 FAT32）中的素材完整复制到本地磁盘，并证明复制结果与源逐字节一致。
+
+命名：应用名 `rustCopyCardApp`，可执行文件（二进制）为缩写 `rcca`。下文命令示例统一使用 `rcca`，Cargo 包名与产物命名见第 13 节。
+
+用法：`rcca <source> <target>`。
 
 参考实现：`https://github.com/nijaru/sy`（Rust 版 rsync 重写）。本方案对其模块的取舍见第 12 节。
 
@@ -326,7 +330,7 @@ sy 是完整的 rsync 重写，规模远超本项目（`rooted_fs` 单个文件�
 ## 13. 工程结构
 
 ```
-Cargo.toml
+Cargo.toml        包名 rustcopycardapp，二进制名 rcca
 src/
 ├── main.rs        入口：阶段编排、退出码映射
 ├── cli.rs         参数解析、互斥校验、默认值
@@ -348,9 +352,18 @@ tests/
 
 依赖（有意保持精简）：`xxhash-rust`、`clap`（derive）、`terminal_size`、`filetime`、`libc`、`ctrlc`、`unicode-width`、`thiserror`。开发依赖：`tempfile`、`assert_cmd`、`predicates`。不引入 tokio、rayon、walkdir（遍历自行实现以便累计错误）。
 
-发布配置：
+Cargo 配置：包名用小写 `rustcopycardapp`（Cargo 的包名规范），二进制名单独指定为 `rcca`，因此 `cargo build --release` 的产物是 `target/release/rcca`（Windows 为 `rcca.exe`）。
 
 ```toml
+[package]
+name = "rustcopycardapp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rcca"
+path = "src/main.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
