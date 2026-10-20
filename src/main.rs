@@ -92,17 +92,18 @@ fn run(cli: Cli) -> Result<i32> {
     }
 
     // ---------- 阶段 1：遍历 source，检查 target ----------
-    ui.set_phase(Phase::Scan, 0, 0);
+    ui.set_phase(Phase::Scan, 0);
     let mut manifest = {
         let mut progress = |count: usize| {
-            ui.set_progress(count as u64, 0);
+            ui.set_progress(count as u64);
             ui.tick(&stats);
         };
         scan::scan_with_progress(&source, &target_root, &mut progress)
             .map_err(|err| Error::preflight_io("遍历源目录失败", err))?
     };
-    ui.set_phase(Phase::Scan, manifest.files.len() as u64, 0);
-    ui.set_progress(manifest.files.len() as u64, 0);
+    ui.set_total_bytes(manifest.total_bytes);
+    ui.set_phase(Phase::Scan, manifest.files.len() as u64);
+    ui.set_progress(manifest.files.len() as u64);
     ui.tick_force(&stats);
 
     if !manifest.errors.is_empty() {
@@ -224,11 +225,7 @@ fn run(cli: Cli) -> Result<i32> {
         on_file_done,
     };
     ui.set_buffer_bytes((opts.slots() * chunk) as u64);
-    ui.set_phase(
-        Phase::Copy,
-        manifest.files.len() as u64,
-        manifest.total_bytes,
-    );
+    ui.set_phase(Phase::Copy, manifest.files.len() as u64);
 
     let copy_report = {
         let mut tick = || ui.tick(&stats);
@@ -242,7 +239,7 @@ fn run(cli: Cli) -> Result<i32> {
         )
     };
     ui.set_buffer_bytes(copy_report.buffer_bytes_effective);
-    ui.set_progress(manifest.files.len() as u64, manifest.total_bytes);
+    ui.set_progress(manifest.files.len() as u64);
     ui.tick_force(&stats);
 
     let interrupted_after_copy = stats.cancel.load(Ordering::SeqCst);
@@ -251,8 +248,8 @@ fn run(cli: Cli) -> Result<i32> {
     let commit_report = if interrupted_after_copy {
         commit::CommitReport::default()
     } else {
-        ui.set_phase(Phase::Commit, manifest.files.len() as u64, 0);
-        ui.set_progress(manifest.files.len() as u64, 0);
+        ui.set_phase(Phase::Commit, manifest.files.len() as u64);
+        ui.set_progress(manifest.files.len() as u64);
         let report = rcca::commit::run(
             &manifest.files,
             &copy_report.outcomes,
@@ -265,19 +262,10 @@ fn run(cli: Cli) -> Result<i32> {
     };
 
     // ---------- 阶段 4：XXH64 all files ----------
-    let committed_bytes: u64 = commit_report
-        .committed
-        .iter()
-        .map(|&index| manifest.files[index].size)
-        .sum();
     let verify_report = if interrupted_after_copy {
         verify::VerifyReport::default()
     } else {
-        ui.set_phase(
-            Phase::Verify,
-            commit_report.committed.len() as u64,
-            committed_bytes.saturating_mul(2),
-        );
+        ui.set_phase(Phase::Verify, commit_report.committed.len() as u64);
         let verify_opts = verify::Options {
             chunk,
             keep_bad: cli.keep_bad,
@@ -293,10 +281,7 @@ fn run(cli: Cli) -> Result<i32> {
             &stats,
             &mut tick,
         );
-        ui.set_progress(
-            report.matched as u64 + report.mismatched.len() as u64,
-            committed_bytes.saturating_mul(2),
-        );
+        ui.set_progress(report.matched as u64 + report.mismatched.len() as u64);
         ui.tick_force(&stats);
         report
     };

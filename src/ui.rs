@@ -29,6 +29,27 @@ impl Phase {
     }
 }
 
+/// 全程进度：总工作量为源清单字节数的两倍，复制完成占一半，校验完成占另一半。
+///
+/// 校验阶段两条流各读一遍，因此按已读字节的一半计入工作量。
+pub fn overall_percent(phase: Phase, total_bytes: u64, written: u64, hashed: u64) -> f64 {
+    if total_bytes == 0 {
+        return match phase {
+            Phase::Scan => 0.0,
+            Phase::Commit => 0.5,
+            Phase::Copy | Phase::Verify => 0.0,
+        };
+    }
+    let denominator = (total_bytes as f64) * 2.0;
+    let worked = match phase {
+        Phase::Scan => 0.0,
+        Phase::Copy => written as f64,
+        Phase::Commit => total_bytes as f64,
+        Phase::Verify => total_bytes as f64 + hashed as f64 / 2.0,
+    };
+    (worked / denominator).clamp(0.0, 1.0)
+}
+
 /// 一次绘制所需的全部信息。
 pub struct Snapshot {
     pub phase: Phase,
@@ -291,10 +312,10 @@ pub struct Ui {
     started: Instant,
     last_draw: Instant,
     phase: Phase,
+    /// 源清单总字节数，全程不变；总进度以 2 倍它作为分母。
+    total_bytes: u64,
     files_total: u64,
     files_done: u64,
-    bytes_total: u64,
-    bytes_done: u64,
     buffer_bytes: u64,
     quiet: bool,
     verbose: bool,
@@ -313,10 +334,9 @@ impl Ui {
             started: Instant::now(),
             last_draw: Instant::now() - Duration::from_secs(1),
             phase: Phase::Scan,
+            total_bytes: 0,
             files_total: 0,
             files_done: 0,
-            bytes_total: 0,
-            bytes_done: 0,
             buffer_bytes: 0,
             quiet,
             verbose,
@@ -341,19 +361,21 @@ impl Ui {
         self.started
     }
 
-    pub fn set_phase(&mut self, phase: Phase, files_total: u64, bytes_total: u64) {
+    /// 源清单总字节数，进入阶段 2 之前设置一次。
+    pub fn set_total_bytes(&mut self, total_bytes: u64) {
+        self.total_bytes = total_bytes;
+    }
+
+    pub fn set_phase(&mut self, phase: Phase, files_total: u64) {
         self.phase = phase;
         self.files_total = files_total;
-        self.bytes_total = bytes_total;
         self.files_done = 0;
-        self.bytes_done = 0;
         self.last_draw = Instant::now() - Duration::from_secs(1);
     }
 
     /// 阶段 1 与阶段 3 的完成量由调用方直接推进（不经过统计计数）。
-    pub fn set_progress(&mut self, files_done: u64, bytes_done: u64) {
+    pub fn set_progress(&mut self, files_done: u64) {
         self.files_done = files_done;
-        self.bytes_done = bytes_done;
     }
 
     pub fn set_buffer_bytes(&mut self, bytes: u64) {
@@ -393,49 +415,45 @@ impl Ui {
             now,
         );
 
-        let (bytes_done, bytes_total, files_done) = match self.phase {
-            Phase::Copy => (
-                stats
-                    .written_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                self.bytes_total,
+        let written = stats
+            .written_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let hashed = stats
+            .hashed_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total_bytes = self.total_bytes;
+
+        let files_done = match self.phase {
+            Phase::Copy => {
                 stats.files_ok.load(std::sync::atomic::Ordering::Relaxed) as u64
                     + stats
                         .files_failed
-                        .load(std::sync::atomic::Ordering::Relaxed) as u64,
-            ),
-            Phase::Verify => (
-                stats
-                    .hashed_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                self.bytes_total,
+                        .load(std::sync::atomic::Ordering::Relaxed) as u64
+            }
+            Phase::Verify => {
                 stats.verify_ok.load(std::sync::atomic::Ordering::Relaxed) as u64
-                    + stats.verify_bad.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    + stats.verify_bad.load(std::sync::atomic::Ordering::Relaxed) as u64
+            }
+            Phase::Scan | Phase::Commit => self.files_done,
+        };
+
+        // 阶段行展示的字节进度：复制看已写字节，校验看单侧已读字节（双方读取各计一半）。
+        let (bytes_done, bytes_total) = match self.phase {
+            Phase::Copy => (written, total_bytes),
+            Phase::Verify => (hashed / 2, total_bytes),
+            Phase::Scan | Phase::Commit => (0, total_bytes),
+        };
+
+        let percent = overall_percent(self.phase, total_bytes, written, hashed);
+
+        // ETA 按当前阶段的剩余工作量与对应方向的速度估算。
+        let eta = match self.phase {
+            Phase::Copy => eta_seconds(total_bytes.saturating_sub(written), write_speed),
+            Phase::Verify => eta_seconds(
+                total_bytes.saturating_mul(2).saturating_sub(hashed),
+                read_speed,
             ),
-            Phase::Scan | Phase::Commit => (self.bytes_done, self.bytes_total, self.files_done),
-        };
-
-        let percent = match self.phase {
-            Phase::Scan | Phase::Commit => {
-                if self.files_total > 0 {
-                    files_done as f64 / self.files_total as f64
-                } else {
-                    0.0
-                }
-            }
-            _ => {
-                if bytes_total > 0 {
-                    bytes_done as f64 / bytes_total as f64
-                } else {
-                    1.0
-                }
-            }
-        };
-
-        let eta = if matches!(self.phase, Phase::Copy | Phase::Verify) {
-            eta_seconds(bytes_total.saturating_sub(bytes_done), write_speed)
-        } else {
-            None
+            Phase::Scan | Phase::Commit => None,
         };
 
         let snapshot = Snapshot {
@@ -559,6 +577,21 @@ mod tests {
             verify_ok: 8,
             verify_bad: 0,
         }
+    }
+
+    #[test]
+    fn overall_progress_splits_copy_and_verify() {
+        let total = 1000u64;
+        assert_eq!(overall_percent(Phase::Scan, total, 0, 0), 0.0);
+        assert_eq!(overall_percent(Phase::Copy, total, 0, 0), 0.0);
+        assert_eq!(overall_percent(Phase::Copy, total, 500, 0), 0.25);
+        assert_eq!(overall_percent(Phase::Copy, total, total, 0), 0.5);
+        assert_eq!(overall_percent(Phase::Commit, total, total, 0), 0.5);
+        // 校验阶段两侧各读一遍，按已读字节的一半计入。
+        assert_eq!(overall_percent(Phase::Verify, total, total, total), 0.75);
+        assert_eq!(overall_percent(Phase::Verify, total, total, total * 2), 1.0);
+        // 没有文件时不应出现除零或超过 1 的进度。
+        assert_eq!(overall_percent(Phase::Copy, 0, 0, 0), 0.0);
     }
 
     #[test]

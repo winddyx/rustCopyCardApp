@@ -98,7 +98,7 @@ pub fn run(
             break;
         }
         let rel = entry.rel.display();
-        stats.set_current(rel.clone());
+        stats.set_current(entry.rel.file_name().to_string_lossy().into_owned());
         let src = source.join(entry.rel.as_path());
         let dst = target.join(entry.rel.as_path());
 

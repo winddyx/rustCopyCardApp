@@ -185,7 +185,7 @@ fn reader_loop(
         if stats.stop_requested() {
             break;
         }
-        stats.set_current(entry.rel.display());
+        stats.set_current(entry.rel.file_name().to_string_lossy().into_owned());
         let abs = source.join(entry.rel.as_path());
         let mut file = match File::open(&abs) {
             Ok(f) => f,
@@ -409,7 +409,7 @@ fn run_serial(
         if stats.stop_requested() {
             break;
         }
-        stats.set_current(entry.rel.display());
+        stats.set_current(entry.rel.file_name().to_string_lossy().into_owned());
         let abs = source.join(entry.rel.as_path());
         let mut file = match File::open(&abs) {
             Ok(f) => f,
@@ -562,6 +562,29 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "清单按路径排序，写入顺序与之相同");
+    }
+
+    #[test]
+    fn current_file_is_shown_as_basename_only() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("deep/nested")).unwrap();
+        std::fs::write(src.path().join("deep/nested/clip.MP4"), b"payload").unwrap();
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let stats = Stats::new();
+        let report = run(
+            &manifest.files,
+            src.path(),
+            dst.path(),
+            &options(4096, 16 * 1024, true),
+            &stats,
+            &mut || {},
+        );
+        assert!(report
+            .outcomes
+            .iter()
+            .all(|o| matches!(o, Some(Outcome::Ok(_)))));
+        assert_eq!(stats.current(), "clip.MP4", "当前文件只显示文件名");
     }
 
     #[test]
