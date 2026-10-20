@@ -1,4 +1,4 @@
-//! 失败路径测试：预检失败、提交冲突、中断、逐文件失败。
+//! 失败路径测试：预检失败、复制冲突、中断、逐文件失败。
 
 use std::fs;
 use std::path::Path;
@@ -96,30 +96,34 @@ fn skip_unreadable_copies_the_rest() {
 }
 
 #[test]
-fn commit_conflict_reports_failure_and_leaves_no_stage() {
+fn deletion_threshold_aborts_mirror() {
+    // 目标里大部分文件在源中不存在：sy 默认 --max-delete 50% 会拒绝删除并报错。
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();
-    write_file(src.path(), "conflict", b"file-content");
-    // 目标同名位置被一个非空目录占用，重命名必然失败。
-    fs::create_dir_all(dst.path().join("conflict").join("inner")).unwrap();
-    write_file(dst.path(), "conflict/inner/keep.txt", b"keep");
+    write_file(src.path(), "keep.bin", b"keep");
+    write_file(dst.path(), "keep.bin", b"keep");
+    write_file(dst.path(), "other1.bin", b"stale");
+    write_file(dst.path(), "other2.bin", b"stale");
 
     let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
-    assert_eq!(output.status.code(), Some(1), "提交失败应返回 1");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("提交 conflict"), "输出：{stdout}");
+    assert_eq!(output.status.code(), Some(1), "复制失败应返回 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("复制失败"), "stderr：{stderr}");
     assert!(
-        !dst.path().join(".conflict.rcptmp").exists(),
-        "失败的暂存文件应被清理"
+        stderr.contains("Deletion threshold"),
+        "应保留 sy 的删除保护：{stderr}"
     );
-    assert!(dst.path().join("conflict/inner/keep.txt").exists());
+    assert!(
+        dst.path().join("other1.bin").exists() && dst.path().join("other2.bin").exists(),
+        "拒绝删除时目标文件应保持原样"
+    );
 }
 
 #[test]
 fn path_with_tmp_suffix_is_rejected() {
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();
-    write_file(src.path(), ".weird.MOV.rcptmp", b"x");
+    write_file(src.path(), ".sy-0badc0de.tmp", b"x");
 
     let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
     assert_eq!(output.status.code(), Some(3));
@@ -139,7 +143,7 @@ fn nested_source_inside_target_is_usage_error() {
 
 #[cfg(unix)]
 #[test]
-fn sigint_leaves_no_final_file() {
+fn sigint_never_leaves_a_partial_final_file() {
     const SIZE: usize = 256 * 1024 * 1024;
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();
@@ -168,19 +172,18 @@ fn sigint_leaves_no_final_file() {
     }
     let status = child.wait_with_output().unwrap().status;
 
-    if status.code() == Some(130) {
-        assert!(
-            !dst.path().join("big.bin").exists(),
-            "中断后不应出现最终文件名"
-        );
-        assert!(
-            !dst.path().join(".big.bin.rcptmp").exists()
-                || dst.path().join(".big.bin.rcptmp").exists(),
-            "暂存文件允许残留，由下一轮清理"
+    let final_path = dst.path().join("big.bin");
+    if final_path.exists() {
+        // 只有完整复制后才允许出现最终文件名。
+        assert_eq!(
+            fs::metadata(&final_path).unwrap().len(),
+            SIZE as u64,
+            "中断后不应留下不完整的最终文件"
         );
     } else {
-        eprintln!(
-            "提示：复制在信号到达前完成（退出码 {:?}），跳过中断断言",
+        assert!(
+            status.code().is_none() || status.code() == Some(130),
+            "被中断时退出码应为 130 或被信号终止：{:?}",
             status.code()
         );
     }

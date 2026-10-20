@@ -1,4 +1,4 @@
-//! rcca 入口：阶段编排、退出码映射、Ctrl-C 处理。
+//! rcca 入口：预检与遍历、交给内嵌的 sy 复制、rcca 校验、退出码映射。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,16 +9,17 @@ use std::time::Instant;
 use clap::Parser;
 
 use rcca::cli::Cli;
-use rcca::commit;
-use rcca::copy::Outcome;
+use rcca::engine::{self, Options as EngineOptions};
 use rcca::error::{Error, Result};
 use rcca::paths;
-use rcca::pipeline;
 use rcca::report::{self, Summary};
 use rcca::scan;
-use rcca::stats::{human_bytes, human_speed, Stats};
+use rcca::stats::{human_bytes, Stats};
 use rcca::ui::{Phase, Ui};
 use rcca::verify;
+
+/// 校验阶段每次读取的块大小。
+const VERIFY_CHUNK: usize = 1024 * 1024;
 
 fn main() {
     let cli = Cli::parse();
@@ -35,14 +36,9 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let started = Instant::now();
     let stats = Arc::new(Stats::new());
-    install_signal_handler(&stats);
+    let mut ui = Ui::new(cli.quiet);
 
-    let mut ui = Ui::new(cli.quiet, cli.verbose);
-    for note in cli.effective_io().2 {
-        eprintln!("rcca: 提示：{note}");
-    }
-
-    // ---------- 阶段 0：参数与卷预检 ----------
+    // ---------- 阶段 1：参数与卷预检 ----------
     let source = fs::canonicalize(&cli.source).map_err(|err| {
         Error::preflight_io(format!("源目录不可用：{}", cli.source.display()), err)
     })?;
@@ -76,35 +72,19 @@ fn run(cli: Cli) -> Result<i32> {
     check_writable(&target_root)?;
     if cli.clean_stale {
         let removed = clean_stale(&target_root);
-        if removed > 0 {
+        if removed > 0 && !cli.quiet {
             eprintln!("rcca: 已清理 {removed} 个残留暂存文件");
         }
     }
 
-    if same_device(&source, &target_root) {
-        eprintln!(
-            "rcca: 提示：源与目标在同一文件系统，读写重叠可能降低吞吐；同盘机械盘建议加 --serial-io 与 --chunk 4M"
-        );
+    if !cli.quiet && same_device(&source, &target_root) {
+        eprintln!("rcca: 提示：源与目标在同一文件系统，读写互相争用可能降低吞吐");
     }
     let fs_type = fs_type_name(&target_root);
-    if let Some(free) = free_space(&target_root) {
-        let _ = free;
-    }
 
-    // ---------- 阶段 1：遍历 source，检查 target ----------
-    ui.set_phase(Phase::Scan, 0);
-    let mut manifest = {
-        let mut progress = |count: usize| {
-            ui.set_progress(count as u64);
-            ui.tick(&stats);
-        };
-        scan::scan_with_progress(&source, &target_root, &mut progress)
-            .map_err(|err| Error::preflight_io("遍历源目录失败", err))?
-    };
-    ui.set_total_bytes(manifest.total_bytes);
-    ui.set_phase(Phase::Scan, manifest.files.len() as u64);
-    ui.set_progress(manifest.files.len() as u64);
-    ui.tick_force(&stats);
+    // ---------- 阶段 2：遍历 source，检查 target ----------
+    let mut manifest = scan::scan(&source, &target_root)
+        .map_err(|err| Error::preflight_io("遍历源目录失败", err))?;
 
     if !manifest.errors.is_empty() {
         return Err(Error::preflight(format!(
@@ -121,9 +101,6 @@ fn run(cli: Cli) -> Result<i32> {
         )));
     }
 
-    scan::create_dirs(&target_root, &manifest.dirs)
-        .map_err(|err| Error::preflight_io("创建目标目录结构失败", err))?;
-
     let unreadable = scan::probe_readable(&source, &manifest.files);
     if !unreadable.is_empty() {
         if cli.skip_unreadable {
@@ -136,7 +113,9 @@ fn run(cli: Cli) -> Result<i32> {
                 stats.files_skipped.fetch_add(1, Ordering::Relaxed);
                 stats.note_failure(format!("跳过不可读文件 {}：{err}", rel.display()));
             }
-            eprintln!("rcca: 已跳过 {} 个不可读文件", unreadable.len());
+            if !cli.quiet {
+                eprintln!("rcca: 已跳过 {} 个不可读文件", unreadable.len());
+            }
         } else {
             return Err(Error::preflight(format!(
                 "{} 个源文件不可读（可用 --skip-unreadable 跳过），首条：{}",
@@ -175,144 +154,83 @@ fn run(cli: Cli) -> Result<i32> {
             target: target_root.clone(),
             files_total: 0,
             bytes_total: 0,
-            copied: 0,
-            copy_failed: 0,
+            created: 0,
+            updated: 0,
             skipped: 0,
-            committed: 0,
-            commit_failed: 0,
+            deleted: 0,
+            bytes_transferred: 0,
+            copy_errors: 0,
             verified: 0,
             verify_failed: 0,
             elapsed: started.elapsed(),
-            read_bytes: 0,
-            written_bytes: 0,
             failures: Vec::new(),
             verbose: cli.verbose,
             interrupted: false,
-            committed_unverified: 0,
         };
         report::print(&summary);
         return Ok(0);
     }
 
-    // ---------- 阶段 2：Copy all files（流水线写 tmp） ----------
-    let (chunk, buffer_bytes, _) = cli.effective_io();
-    // 非交互模式下逐文件即时输出，交互模式由 TUI 呈现。
-    let on_file_done = if ui.interactive() {
-        None
-    } else {
-        let names: Vec<String> = manifest
-            .files
-            .iter()
-            .map(|entry| entry.rel.display())
-            .collect();
-        let verbose = ui.verbose();
-        Some(std::sync::Arc::new(move |index: usize, outcome: &Outcome| {
-            let rel = names.get(index).cloned().unwrap_or_default();
-            match outcome {
-                Outcome::Ok(_) => println!("COPY {rel}"),
-                Outcome::Failed { reason } => println!("COPY {rel} FAILED {reason}"),
-            }
-            let _ = verbose;
-        })
-            as std::sync::Arc<dyn Fn(usize, &Outcome) + Send + Sync>)
-    };
-    let opts = pipeline::Options {
-        chunk,
-        buffer_bytes,
-        fsync: !cli.no_fsync,
-        serial_io: cli.serial_io,
-        fail_fast: cli.fail_fast,
-        on_file_done,
-    };
-    ui.set_buffer_bytes((opts.slots() * chunk) as u64);
-    ui.set_phase(Phase::Copy, manifest.files.len() as u64);
-
-    let copy_report = {
-        let mut tick = || ui.tick(&stats);
-        pipeline::run(
-            &manifest.files,
-            &source,
-            &target_root,
-            &opts,
-            &stats,
-            &mut tick,
-        )
-    };
-    ui.set_buffer_bytes(copy_report.buffer_bytes_effective);
-    ui.set_progress(manifest.files.len() as u64);
-    ui.tick_force(&stats);
-
-    let interrupted_after_copy = stats.cancel.load(Ordering::SeqCst);
-
-    // ---------- 阶段 3：再次遍历、校验长度、原子重命名 ----------
-    let commit_report = if interrupted_after_copy {
-        commit::CommitReport::default()
-    } else {
-        ui.set_phase(Phase::Commit, manifest.files.len() as u64);
-        ui.set_progress(manifest.files.len() as u64);
-        let report = rcca::commit::run(
-            &manifest.files,
-            &copy_report.outcomes,
-            &source,
-            &target_root,
-            !cli.no_fsync,
+    // ---------- 阶段 3：交给内嵌的 sy 引擎复制（输出透传） ----------
+    if !cli.quiet {
+        eprintln!(
+            "rcca: 复制 {} 个文件，共 {}，引擎 sy {}（镜像，删除目标中多余文件）",
+            manifest.files.len(),
+            human_bytes(manifest.total_bytes),
+            engine::VERSION
         );
-        ui.tick_force(&stats);
-        report
+    }
+    let engine_opts = EngineOptions {
+        delete: true,
+        quiet: cli.quiet,
+        progress: !cli.quiet,
+        max_errors: cli.fail_fast.then_some(1),
     };
+    let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
+    for err in &copy.errors {
+        stats.note_failure(format!(
+            "复制 {}：{}（{}）",
+            err.path.display(),
+            err.error,
+            err.action
+        ));
+    }
 
-    // ---------- 阶段 4：XXH64 all files ----------
-    let verify_report = if interrupted_after_copy {
-        verify::VerifyReport::default()
-    } else {
-        ui.set_phase(Phase::Verify, commit_report.committed.len() as u64);
-        let verify_opts = verify::Options {
-            chunk,
-            keep_bad: cli.keep_bad,
-            no_cache: cli.verify_no_cache,
-        };
+    // ---------- 阶段 4：rcca 遍历并逐文件 XXH64 校验 ----------
+    // 复制阶段不拦截 Ctrl-C（交给内嵌 sy 自行结束），校验阶段才接管。
+    install_signal_handler(&stats);
+    ui.set_total_bytes(manifest.total_bytes);
+    ui.set_phase(Phase::Verify, manifest.files.len() as u64);
+
+    let indices: Vec<usize> = (0..manifest.files.len()).collect();
+    let verify_opts = verify::Options {
+        chunk: VERIFY_CHUNK,
+        keep_bad: cli.keep_bad,
+        no_cache: cli.verify_no_cache,
+    };
+    let verify_report = {
         let mut tick = |stats: &Stats| ui.tick(stats);
-        let report = verify::run(
+        verify::run(
             &manifest.files,
-            &commit_report.committed,
+            &indices,
             &source,
             &target_root,
             &verify_opts,
             &stats,
             &mut tick,
-        );
-        ui.set_progress(report.matched as u64 + report.mismatched.len() as u64);
-        ui.tick_force(&stats);
-        report
+        )
     };
+    ui.set_progress((verify_report.matched + verify_report.mismatched.len()) as u64);
+    ui.tick_force(&stats);
 
-    // 校验阶段也可能被 Ctrl-C 打断，结束时再判定一次。
     let interrupted = stats.cancel.load(Ordering::SeqCst);
-
-    let dir_warnings = scan::restore_dir_modes(&target_root, &manifest.dirs);
-    for warning in &dir_warnings {
-        eprintln!("rcca: 警告：{warning}");
+    if interrupted {
+        stats.note_failure("校验阶段被中断".to_string());
     }
-
     ui.finish();
 
     // ---------- 汇总 ----------
-    let mut failures: Vec<String> = Vec::new();
-    for (index, outcome) in copy_report.outcomes.iter().enumerate() {
-        if let Some(Outcome::Failed { reason }) = outcome {
-            failures.push(format!(
-                "复制 {}：{reason}",
-                manifest.files[index].rel.display()
-            ));
-        }
-    }
-    for (index, failure) in &commit_report.failures {
-        failures.push(format!(
-            "提交 {}：{}",
-            manifest.files[*index].rel.display(),
-            failure.describe()
-        ));
-    }
+    let mut failures = stats.failure_examples();
     failures.extend(verify_report.mismatched.clone());
     failures.extend(
         verify_report
@@ -330,41 +248,22 @@ fn run(cli: Cli) -> Result<i32> {
         target: target_root.clone(),
         files_total: manifest.files.len(),
         bytes_total: manifest.total_bytes,
-        copied: stats.files_ok.load(Ordering::Relaxed),
-        copy_failed: copy_report
-            .outcomes
-            .iter()
-            .filter(|o| matches!(o, Some(Outcome::Failed { .. })))
-            .count(),
-        skipped: stats.files_skipped.load(Ordering::Relaxed),
-        committed: commit_report.committed_count(),
-        commit_failed: commit_report.failure_count(),
+        created: copy.files_created,
+        updated: copy.files_updated,
+        skipped: copy.files_skipped + stats.files_skipped.load(Ordering::Relaxed),
+        deleted: copy.files_deleted,
+        bytes_transferred: copy.bytes_transferred,
+        copy_errors: copy.errors.len(),
         verified: verify_report.matched,
         verify_failed: verify_report.mismatched.len()
             + verify_report.missing.len()
             + verify_report.errors.len(),
         elapsed: started.elapsed(),
-        read_bytes: stats.read_bytes.load(Ordering::Relaxed),
-        written_bytes: stats.written_bytes.load(Ordering::Relaxed),
         failures,
         verbose: cli.verbose,
         interrupted,
-        committed_unverified: commit_report
-            .committed_count()
-            .saturating_sub(verify_report.matched + verify_report.mismatched.len()),
     };
     report::print(&summary);
-
-    let seconds = summary.elapsed.as_secs_f64().max(0.001);
-    if ui.verbose() {
-        println!(
-            "细节：读速 {}，写速 {}，缓冲 {}，块 {}",
-            human_speed(stats.read_bytes.load(Ordering::Relaxed) as f64 / seconds),
-            human_speed(stats.written_bytes.load(Ordering::Relaxed) as f64 / seconds),
-            human_bytes(copy_report.buffer_bytes_effective),
-            human_bytes(copy_report.chunk_effective as u64)
-        );
-    }
 
     if interrupted {
         return Ok(130);
@@ -397,7 +296,7 @@ fn check_writable(root: &Path) -> Result<()> {
     }
 }
 
-/// 清理目标卷上遗留的暂存文件，返回删除数量。
+/// 清理目标卷上遗留的 sy 暂存文件，返回删除数量。
 fn clean_stale(root: &Path) -> usize {
     let mut removed = 0usize;
     let mut pending = vec![root.to_path_buf()];

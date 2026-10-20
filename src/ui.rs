@@ -1,4 +1,6 @@
-//! 四行自适应终端界面：百分比与当前文件、计数与时间、阶段与进度、缓冲与速率。
+//! 四行自适应终端界面：百分比与当前文件、校验计数与时间、阶段与进度、速率。
+//!
+//! 复制阶段由内嵌的 sy 直接输出，本界面只在校验阶段绘制。
 //!
 //! 各行按固定列宽渲染成表格，数值增长不会移动列位置；
 //! 终端宽度不足时按优先级丢弃整列，单元格内容超长时在单元格内截断。
@@ -37,7 +39,9 @@ pub fn overall_percent(phase: Phase, total_bytes: u64, written: u64, hashed: u64
         return match phase {
             Phase::Scan => 0.0,
             Phase::Commit => 0.5,
-            Phase::Copy | Phase::Verify => 0.0,
+            // 复制阶段交给 sy 后没有可用的字节计数；校验一开始就占满后半程。
+            Phase::Copy => 0.0,
+            Phase::Verify => 0.5,
         };
     }
     let denominator = (total_bytes as f64) * 2.0;
@@ -59,14 +63,8 @@ pub struct Snapshot {
     pub bytes_done: u64,
     pub bytes_total: u64,
     pub read_speed: f64,
-    pub write_speed: f64,
     pub eta: Option<u64>,
-    pub ok: u64,
-    pub fail: u64,
-    pub skip: u64,
     pub elapsed: Duration,
-    pub buffer_used: u64,
-    pub buffer_bytes: u64,
     pub current: String,
     pub verify_ok: u64,
     pub verify_bad: u64,
@@ -157,24 +155,26 @@ fn render_head_line(snapshot: &Snapshot, width: usize) -> String {
     format!("{prefix}{}", truncate_start(&snapshot.current, available))
 }
 
-/// 第二行：成功/失败/跳过计数、已用时间与 ETA；校验阶段换成匹配/不一致计数。
+/// 第二行：校验的匹配与不一致计数、已用时间与 ETA。
 fn render_counters_line(snapshot: &Snapshot, width: usize) -> String {
     let elapsed = format!("elapsed {:>9}", human_duration(snapshot.elapsed.as_secs()));
     let eta = snapshot
         .eta
         .map(|seconds| format!("ETA {:>8}", human_duration(seconds)));
 
-    let mut cells = match snapshot.phase {
-        Phase::Verify => vec![
-            Cell::left(format!("match {:>6}", snapshot.verify_ok), 12, 100),
-            Cell::left(format!("mismatch {:>6}", snapshot.verify_bad), 15, 100),
-        ],
-        _ => vec![
-            Cell::left(format!("ok {:>6}", snapshot.ok), 9, 100),
-            Cell::left(format!("fail {:>6}", snapshot.fail), 11, 100),
-            Cell::left(format!("skip {:>6}", snapshot.skip), 11, 80),
-        ],
-    };
+    let mut cells = Vec::new();
+    if snapshot.phase == Phase::Verify {
+        cells.push(Cell::left(
+            format!("match {:>6}", snapshot.verify_ok),
+            12,
+            100,
+        ));
+        cells.push(Cell::left(
+            format!("mismatch {:>6}", snapshot.verify_bad),
+            15,
+            100,
+        ));
+    }
     cells.push(Cell::left(elapsed, 17, 60));
     if let Some(eta) = eta {
         cells.push(Cell::left(eta, 12, 40));
@@ -208,39 +208,20 @@ fn render_phase_line(snapshot: &Snapshot, width: usize) -> String {
     build_row(cells, width)
 }
 
-/// 第四行：缓冲占用与读写速率。
+/// 第四行：读取速率（哈希从两侧读数据）。
 fn render_io_line(snapshot: &Snapshot, width: usize) -> String {
-    if snapshot.buffer_bytes == 0 {
-        // 缓冲尚未启用（扫描阶段），整行留空。
+    if !matches!(snapshot.phase, Phase::Copy | Phase::Verify) {
         return String::new();
     }
-    let mut cells = vec![Cell::left(
-        format!(
-            "buf {:>4}/{:>4} MiB",
-            snapshot.buffer_used / (1024 * 1024),
-            snapshot.buffer_bytes / (1024 * 1024)
-        ),
-        19,
-        60,
-    )];
-
-    if matches!(snapshot.phase, Phase::Copy | Phase::Verify) {
-        let (read_value, read_unit) = speed_parts(snapshot.read_speed);
-        cells.push(Cell::left(
+    let (read_value, read_unit) = speed_parts(snapshot.read_speed);
+    build_row(
+        vec![Cell::left(
             format!("R {read_value:>6.1} {read_unit:>3}/s"),
             14,
             40,
-        ));
-    }
-    if snapshot.phase == Phase::Copy {
-        let (write_value, write_unit) = speed_parts(snapshot.write_speed);
-        cells.push(Cell::left(
-            format!("W {write_value:>6.1} {write_unit:>3}/s"),
-            14,
-            30,
-        ));
-    }
-    build_row(cells, width)
+        )],
+        width,
+    )
 }
 
 fn truncate_end(s: &str, max_width: usize) -> String {
@@ -288,7 +269,6 @@ fn truncate_start(s: &str, max_width: usize) -> String {
 pub struct Ui {
     painter: Painter,
     read_meter: SpeedMeter,
-    write_meter: SpeedMeter,
     started: Instant,
     last_draw: Instant,
     phase: Phase,
@@ -296,49 +276,26 @@ pub struct Ui {
     total_bytes: u64,
     files_total: u64,
     files_done: u64,
-    buffer_bytes: u64,
-    quiet: bool,
-    verbose: bool,
     enabled: bool,
     last_current: String,
 }
 
 impl Ui {
-    pub fn new(quiet: bool, verbose: bool) -> Self {
+    pub fn new(quiet: bool) -> Self {
         let interactive = io::stdout().is_terminal() && !quiet;
         let color = interactive && std::env::var_os("NO_COLOR").is_none();
         Self {
             painter: Painter::new(interactive, color),
             read_meter: SpeedMeter::new(),
-            write_meter: SpeedMeter::new(),
             started: Instant::now(),
             last_draw: Instant::now() - Duration::from_secs(1),
             phase: Phase::Scan,
             total_bytes: 0,
             files_total: 0,
             files_done: 0,
-            buffer_bytes: 0,
-            quiet,
-            verbose,
             enabled: interactive,
             last_current: String::new(),
         }
-    }
-
-    pub fn interactive(&self) -> bool {
-        self.enabled
-    }
-
-    pub fn verbose(&self) -> bool {
-        self.verbose
-    }
-
-    pub fn quiet(&self) -> bool {
-        self.quiet
-    }
-
-    pub fn started(&self) -> Instant {
-        self.started
     }
 
     /// 源清单总字节数，进入阶段 2 之前设置一次。
@@ -356,10 +313,6 @@ impl Ui {
     /// 阶段 1 与阶段 3 的完成量由调用方直接推进（不经过统计计数）。
     pub fn set_progress(&mut self, files_done: u64) {
         self.files_done = files_done;
-    }
-
-    pub fn set_buffer_bytes(&mut self, bytes: u64) {
-        self.buffer_bytes = bytes;
     }
 
     /// 刷新界面（内部按 10 Hz 节流，非交互模式直接返回）。
@@ -388,52 +341,35 @@ impl Ui {
             stats.read_bytes.load(std::sync::atomic::Ordering::Relaxed),
             now,
         );
-        let write_speed = self.write_meter.sample(
-            stats
-                .written_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            now,
-        );
 
-        let written = stats
-            .written_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
         let hashed = stats
             .hashed_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
         let total_bytes = self.total_bytes;
 
         let files_done = match self.phase {
-            Phase::Copy => {
-                stats.files_ok.load(std::sync::atomic::Ordering::Relaxed) as u64
-                    + stats
-                        .files_failed
-                        .load(std::sync::atomic::Ordering::Relaxed) as u64
-            }
             Phase::Verify => {
                 stats.verify_ok.load(std::sync::atomic::Ordering::Relaxed) as u64
                     + stats.verify_bad.load(std::sync::atomic::Ordering::Relaxed) as u64
             }
-            Phase::Scan | Phase::Commit => self.files_done,
+            Phase::Scan | Phase::Copy | Phase::Commit => self.files_done,
         };
 
-        // 阶段行展示的字节进度：复制看已写字节，校验看单侧已读字节（双方读取各计一半）。
+        // 阶段行展示的字节进度：校验按单侧已读字节（两侧各读一遍，各计一半）。
         let (bytes_done, bytes_total) = match self.phase {
-            Phase::Copy => (written, total_bytes),
             Phase::Verify => (hashed / 2, total_bytes),
-            Phase::Scan | Phase::Commit => (0, total_bytes),
+            Phase::Scan | Phase::Copy | Phase::Commit => (0, total_bytes),
         };
 
-        let percent = overall_percent(self.phase, total_bytes, written, hashed);
+        let percent = overall_percent(self.phase, total_bytes, 0, hashed);
 
-        // ETA 按当前阶段的剩余工作量与对应方向的速度估算。
+        // ETA 按当前阶段的剩余工作量与读速估算。
         let eta = match self.phase {
-            Phase::Copy => eta_seconds(total_bytes.saturating_sub(written), write_speed),
             Phase::Verify => eta_seconds(
                 total_bytes.saturating_mul(2).saturating_sub(hashed),
                 read_speed,
             ),
-            Phase::Scan | Phase::Commit => None,
+            Phase::Scan | Phase::Copy | Phase::Commit => None,
         };
 
         let snapshot = Snapshot {
@@ -448,20 +384,8 @@ impl Ui {
             bytes_done,
             bytes_total,
             read_speed,
-            write_speed,
             eta,
-            ok: stats.files_ok.load(std::sync::atomic::Ordering::Relaxed) as u64,
-            fail: stats
-                .files_failed
-                .load(std::sync::atomic::Ordering::Relaxed) as u64,
-            skip: stats
-                .files_skipped
-                .load(std::sync::atomic::Ordering::Relaxed) as u64,
             elapsed: now.duration_since(self.started),
-            buffer_used: stats
-                .in_flight_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            buffer_bytes: self.buffer_bytes,
             current: stats.current(),
             verify_ok: stats.verify_ok.load(std::sync::atomic::Ordering::Relaxed) as u64,
             verify_bad: stats.verify_bad.load(std::sync::atomic::Ordering::Relaxed) as u64,
@@ -545,14 +469,8 @@ mod tests {
             bytes_done: 42 * 1024 * 1024 * 1024,
             bytes_total: 96 * 1024 * 1024 * 1024,
             read_speed: 410.0 * 1024.0 * 1024.0,
-            write_speed: 385.0 * 1024.0 * 1024.0,
             eta: Some(52),
-            ok: 12,
-            fail: 0,
-            skip: 0,
             elapsed: Duration::from_secs(14),
-            buffer_used: 42 * 1024 * 1024,
-            buffer_bytes: 128 * 1024 * 1024,
             current: "C7463.MP4".to_string(),
             verify_ok: 8,
             verify_bad: 0,
@@ -560,50 +478,50 @@ mod tests {
     }
 
     #[test]
-    fn overall_progress_splits_copy_and_verify() {
+    fn overall_progress_puts_verify_in_the_second_half() {
         let total = 1000u64;
         assert_eq!(overall_percent(Phase::Scan, total, 0, 0), 0.0);
-        assert_eq!(overall_percent(Phase::Copy, total, 0, 0), 0.0);
-        assert_eq!(overall_percent(Phase::Copy, total, 500, 0), 0.25);
+        // 复制交给 sy 后，校验开始时已经是 50%。
+        assert_eq!(overall_percent(Phase::Verify, total, 0, 0), 0.5);
+        // 校验两侧各读一遍，按已读字节的一半计入。
+        assert_eq!(overall_percent(Phase::Verify, total, 0, total), 0.75);
+        assert_eq!(overall_percent(Phase::Verify, total, 0, total * 2), 1.0);
         assert_eq!(overall_percent(Phase::Copy, total, total, 0), 0.5);
-        assert_eq!(overall_percent(Phase::Commit, total, total, 0), 0.5);
-        // 校验阶段两侧各读一遍，按已读字节的一半计入。
-        assert_eq!(overall_percent(Phase::Verify, total, total, total), 0.75);
-        assert_eq!(overall_percent(Phase::Verify, total, total, total * 2), 1.0);
         // 没有文件时不应出现除零或超过 1 的进度。
-        assert_eq!(overall_percent(Phase::Copy, 0, 0, 0), 0.0);
+        assert_eq!(overall_percent(Phase::Verify, 0, 0, 0), 0.5);
     }
 
     #[test]
     fn renders_percent_and_file_on_first_line() {
-        let lines = render(&snapshot(Phase::Copy, 0.185), 120);
+        let lines = render(&snapshot(Phase::Verify, 0.5), 120);
         assert_eq!(lines.len(), 4);
-        assert_eq!(lines[0], " 18.5%  >  C7463.MP4");
-        assert!(lines[1].starts_with("ok "));
+        assert_eq!(lines[0], " 50.0%  >  C7463.MP4");
+        assert!(lines[1].starts_with("match "));
+        assert!(lines[1].contains("mismatch "));
         assert!(lines[1].contains("ETA"));
-        assert!(lines[2].starts_with("COPY"));
-        assert!(lines[3].starts_with("buf "));
-        assert!(lines[3].contains("R "));
-        assert!(lines[3].contains("W "));
+        assert!(lines[2].starts_with("VRFY"));
+        assert!(lines[2].contains("GiB"));
+        assert!(lines[3].starts_with("R "));
     }
 
     #[test]
-    fn verify_phase_uses_match_counters_and_hides_write_speed() {
-        let lines = render(&snapshot(Phase::Verify, 0.75), 120);
-        assert!(lines[1].starts_with("match "));
-        assert!(lines[1].contains("mismatch "));
+    fn counters_line_has_no_copy_counters() {
+        let lines = render(&snapshot(Phase::Verify, 0.6), 120);
+        assert!(
+            !lines[1].contains("ok "),
+            "复制计数由 sy 输出，不再出现在界面里"
+        );
         assert!(!lines[1].contains("skip"));
-        assert!(!lines[3].contains("W "), "校验阶段不显示写速");
-        assert!(lines[3].contains("R "));
     }
 
     #[test]
     fn columns_do_not_shift_when_counters_grow() {
-        let mut small = snapshot(Phase::Copy, 0.5);
-        small.ok = 9;
+        let mut small = snapshot(Phase::Verify, 0.5);
+        small.verify_ok = 9;
         small.files_done = 9;
         let mut large = small.clone_shallow();
-        large.ok = 123456;
+        large.verify_ok = 123456;
+        large.verify_bad = 654321;
         large.files_done = 123456;
         large.files_total = 654321;
         large.elapsed = Duration::from_secs(3 * 3600 + 65);
@@ -611,9 +529,11 @@ mod tests {
         let small_lines = render(&small, 120);
         let large_lines = render(&large, 120);
 
-        let small_fail = small_lines[1].find("fail").unwrap();
-        let large_fail = large_lines[1].find("fail").unwrap();
-        assert_eq!(small_fail, large_fail, "fail 列位置不应移动");
+        assert_eq!(
+            small_lines[1].find("mismatch"),
+            large_lines[1].find("mismatch"),
+            "mismatch 列位置不应移动"
+        );
         assert_eq!(
             small_lines[1].width(),
             large_lines[1].width(),
@@ -628,34 +548,25 @@ mod tests {
 
     #[test]
     fn cells_are_truncated_when_content_exceeds_width() {
-        let mut snap = snapshot(Phase::Copy, 0.5);
-        snap.ok = u64::MAX;
-        snap.buffer_used = u64::MAX;
+        let mut snap = snapshot(Phase::Verify, 0.5);
+        snap.verify_ok = u64::MAX;
+        snap.verify_bad = u64::MAX;
         let lines = render(&snap, 120);
         for line in &lines {
             assert!(line.width() <= 120, "行宽超出：{line}");
         }
-        assert!(
-            lines[1].contains('…') || lines[1].width() <= 120,
-            "超长单元格应被截断：{}",
-            lines[1]
-        );
     }
 
     #[test]
     fn degrades_columns_as_width_shrinks() {
-        let wide = render(&snapshot(Phase::Copy, 0.5), 120).join("\n");
+        let wide = render(&snapshot(Phase::Verify, 0.5), 120).join("\n");
         assert!(wide.contains("ETA"));
-        assert!(wide.contains("W "));
         assert!(wide.contains("GiB"));
 
-        let mid = render(&snapshot(Phase::Copy, 0.5), 60).join("\n");
+        let mid = render(&snapshot(Phase::Verify, 0.5), 40).join("\n");
         assert!(!mid.contains("ETA"), "宽度不足时先丢 ETA：{mid}");
 
-        let narrow = render(&snapshot(Phase::Copy, 0.5), 40).join("\n");
-        assert!(!narrow.contains("W "), "继续丢写速：{narrow}");
-
-        let tiny = render(&snapshot(Phase::Copy, 0.5), 20).join("\n");
+        let tiny = render(&snapshot(Phase::Verify, 0.5), 20).join("\n");
         assert!(tiny.contains('%'));
         assert!(!tiny.contains("GiB"));
     }
@@ -663,7 +574,7 @@ mod tests {
     #[test]
     fn every_line_fits_the_width() {
         for width in [20usize, 30, 44, 60, 72, 90, 110, 200] {
-            let lines = render(&snapshot(Phase::Copy, 0.42), width);
+            let lines = render(&snapshot(Phase::Verify, 0.42), width);
             assert_eq!(lines.len(), 4);
             for line in lines {
                 assert!(
@@ -676,17 +587,15 @@ mod tests {
     }
 
     #[test]
-    fn io_line_is_empty_before_buffer_is_configured() {
-        let mut snap = snapshot(Phase::Scan, 0.0);
-        snap.buffer_bytes = 0;
-        let lines = render(&snap, 100);
+    fn io_line_is_empty_outside_io_phases() {
+        let lines = render(&snapshot(Phase::Scan, 0.0), 100);
         assert_eq!(lines[3], "");
         assert_eq!(lines.len(), 4);
     }
 
     #[test]
     fn long_file_names_keep_their_tail() {
-        let mut snap = snapshot(Phase::Copy, 0.1);
+        let mut snap = snapshot(Phase::Verify, 0.6);
         snap.current = "素材目录_第一期_相机A_0001.MOV".to_string();
         let lines = render(&snap, 40);
         assert!(lines[0].width() <= 40);
@@ -703,14 +612,8 @@ mod tests {
                 bytes_done: self.bytes_done,
                 bytes_total: self.bytes_total,
                 read_speed: self.read_speed,
-                write_speed: self.write_speed,
                 eta: self.eta,
-                ok: self.ok,
-                fail: self.fail,
-                skip: self.skip,
                 elapsed: self.elapsed,
-                buffer_used: self.buffer_used,
-                buffer_bytes: self.buffer_bytes,
                 current: self.current.clone(),
                 verify_ok: self.verify_ok,
                 verify_bad: self.verify_bad,

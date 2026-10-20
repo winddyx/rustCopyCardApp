@@ -5,8 +5,9 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-/// 暂存文件名后缀。
-pub const TMP_SUFFIX: &str = ".rcptmp";
+/// sy 引擎的暂存文件名前缀与后缀：`.sy-xxxxxxxx.tmp`。
+pub const TMP_PREFIX: &str = ".sy-";
+pub const TMP_SUFFIX: &str = ".tmp";
 /// 校验失败时的隔离后缀。
 pub const BAD_SUFFIX: &str = ".badhash";
 
@@ -60,20 +61,6 @@ impl RelPath {
     }
 }
 
-/// 最终路径对应的暂存路径：同目录下 `.<name>.rcptmp`。
-pub fn tmp_rel_path(rel: &Path) -> PathBuf {
-    let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-    let name = rel.file_name().unwrap_or_default();
-    let mut tmp_name = OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(TMP_SUFFIX);
-    if parent.as_os_str().is_empty() {
-        PathBuf::from(tmp_name)
-    } else {
-        parent.join(tmp_name)
-    }
-}
-
 /// 校验失败时的隔离路径：同目录下 `.<name>.badhash`。
 pub fn bad_rel_path(rel: &Path) -> PathBuf {
     let parent = rel.parent().unwrap_or_else(|| Path::new(""));
@@ -88,10 +75,11 @@ pub fn bad_rel_path(rel: &Path) -> PathBuf {
     }
 }
 
-/// 文件名是否形如本工具的暂存文件。
+/// 文件名是否形如 sy 的暂存文件（同时兼容旧版 rcca 的 `.rcptmp`）。
 pub fn looks_like_tmp(name: &std::ffi::OsStr) -> bool {
     let s = name.to_string_lossy();
-    s.starts_with('.') && s.ends_with(TMP_SUFFIX) && s.len() > TMP_SUFFIX.len() + 1
+    (s.starts_with(TMP_PREFIX) && s.ends_with(TMP_SUFFIX))
+        || (s.starts_with('.') && s.ends_with(".rcptmp") && s.len() > ".rcptmp".len() + 1)
 }
 
 /// 目标根是否等于源根或位于其内 / 反之。两者都已规范化。
@@ -187,22 +175,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tmp_path_is_sibling_hidden_name() {
-        assert_eq!(
-            tmp_rel_path(Path::new("a/b/c.MOV")),
-            PathBuf::from("a/b/.c.MOV.rcptmp")
-        );
-        assert_eq!(
-            tmp_rel_path(Path::new("c.MOV")),
-            PathBuf::from(".c.MOV.rcptmp")
-        );
-        assert_eq!(
-            tmp_rel_path(Path::new("a/.hidden")),
-            PathBuf::from("a/..hidden.rcptmp")
-        );
-    }
-
-    #[test]
     fn bad_path_is_sibling_hidden_name() {
         assert_eq!(
             bad_rel_path(Path::new("a/c.MOV")),
@@ -229,6 +201,7 @@ mod tests {
 
     #[test]
     fn tmp_name_detection() {
+        assert!(looks_like_tmp(std::ffi::OsStr::new(".sy-1a2b3c4d.tmp")));
         assert!(looks_like_tmp(std::ffi::OsStr::new(".a.MOV.rcptmp")));
         assert!(!looks_like_tmp(std::ffi::OsStr::new("a.MOV")));
         assert!(!looks_like_tmp(std::ffi::OsStr::new(".rcptmp")));

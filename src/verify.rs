@@ -180,6 +180,8 @@ fn hash_with_progress(
             Err(err) => return Err(err),
         };
         hasher.update(&buffer[..n]);
+        // 两侧都要读，read_bytes 供界面估算速率，hashed_bytes 供进度与 ETA。
+        stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         stats.hashed_bytes.fetch_add(n as u64, Ordering::Relaxed);
         progress(stats);
     }

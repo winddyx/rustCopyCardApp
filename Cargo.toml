@@ -1,6 +1,6 @@
 [package]
 name = "rustcopycardapp"
-version = "1.0.2"
+version = "2.0.0"
 edition = "2021"
 description = "相机存储卡复制工具：四阶段复制、XXH64 校验、tmp 原子提交"
 license = "MIT"
@@ -14,6 +14,8 @@ name = "rcca"
 path = "src/main.rs"
 
 [dependencies]
+sy = { path = "vendor/sy" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 filetime = "0.2"

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::stats::{human_bytes, human_duration, human_speed};
+use crate::stats::{human_bytes, human_duration};
 
 #[derive(Debug, Clone)]
 pub struct Summary {
@@ -11,20 +11,20 @@ pub struct Summary {
     pub target: PathBuf,
     pub files_total: usize,
     pub bytes_total: u64,
-    pub copied: usize,
-    pub copy_failed: usize,
+    /// sy 复制的统计。
+    pub created: u64,
+    pub updated: u64,
     pub skipped: usize,
-    pub committed: usize,
-    pub commit_failed: usize,
+    pub deleted: usize,
+    pub bytes_transferred: u64,
+    pub copy_errors: usize,
+    /// rcca 校验的结果。
     pub verified: usize,
     pub verify_failed: usize,
     pub elapsed: Duration,
-    pub read_bytes: u64,
-    pub written_bytes: u64,
     pub failures: Vec<String>,
     pub verbose: bool,
     pub interrupted: bool,
-    pub committed_unverified: usize,
 }
 
 const MAX_PRINTED_FAILURES: usize = 20;
@@ -45,37 +45,29 @@ pub fn render(summary: &Summary) -> Vec<String> {
         summary.files_total,
         human_bytes(summary.bytes_total)
     ));
-
-    let seconds = summary.elapsed.as_secs_f64().max(0.001);
     lines.push(format!(
-        "耗时 {}，平均读速 {}，平均写速 {}",
-        human_duration(summary.elapsed.as_secs()),
-        human_speed(summary.read_bytes as f64 / seconds),
-        human_speed(summary.written_bytes as f64 / seconds)
+        "耗时 {}",
+        human_duration(summary.elapsed.as_secs())
     ));
 
     lines.push(format!(
-        "复制成功 {} 个，失败 {} 个，跳过 {} 个",
-        summary.copied, summary.copy_failed, summary.skipped
+        "复制（sy）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
+        summary.created,
+        summary.updated,
+        summary.skipped,
+        summary.deleted,
+        human_bytes(summary.bytes_transferred)
     ));
+    if summary.copy_errors > 0 {
+        lines.push(format!("复制报错 {} 个", summary.copy_errors));
+    }
     lines.push(format!(
-        "提交成功 {} 个，失败 {} 个",
-        summary.committed, summary.commit_failed
-    ));
-    lines.push(format!(
-        "校验通过 {} 个，失败 {} 个",
+        "校验（XXH64）：通过 {} 个，失败 {} 个",
         summary.verified, summary.verify_failed
     ));
 
     if summary.interrupted {
-        if summary.committed_unverified > 0 {
-            lines.push(format!(
-                "已中断：已提交但未校验 {} 个文件",
-                summary.committed_unverified
-            ));
-        } else {
-            lines.push("已中断：未提交任何文件".to_string());
-        }
+        lines.push("已中断：校验未完成，目标目录中可能存在未校验的文件".to_string());
     }
 
     if !summary.failures.is_empty() {
@@ -100,7 +92,7 @@ pub fn render(summary: &Summary) -> Vec<String> {
     lines.push(if ok {
         "结论：全部文件已复制并通过 XXH64 校验".to_string()
     } else if summary.interrupted {
-        "结论：任务被中断，目标目录中不存在未完成的最终文件名".to_string()
+        "结论：任务被中断".to_string()
     } else {
         "结论：任务失败，详见上面的失败明细".to_string()
     });
@@ -118,27 +110,25 @@ mod tests {
             target: PathBuf::from("/out"),
             files_total: 2,
             bytes_total: 2048,
-            copied: 2,
-            copy_failed: 0,
+            created: 2,
+            updated: 0,
             skipped: 0,
-            committed: 2,
-            commit_failed: 0,
+            deleted: 0,
+            bytes_transferred: 2048,
+            copy_errors: 0,
             verified: 2,
             verify_failed: 0,
             elapsed: Duration::from_secs(3),
-            read_bytes: 2048,
-            written_bytes: 2048,
             failures: Vec::new(),
             verbose: false,
             interrupted: false,
-            committed_unverified: 0,
         }
     }
 
     #[test]
     fn success_summary_states_success() {
         let lines = render(&base());
-        assert!(lines.iter().any(|l| l.contains("校验通过 2 个")));
+        assert!(lines.iter().any(|l| l.contains("校验（XXH64）：通过 2 个")));
         assert!(lines.last().unwrap().contains("全部文件已复制"));
     }
 
@@ -157,8 +147,16 @@ mod tests {
     fn interrupted_summary_is_explicit() {
         let mut summary = base();
         summary.interrupted = true;
-        summary.committed_unverified = 3;
         let lines = render(&summary);
-        assert!(lines.iter().any(|l| l.contains("已提交但未校验 3 个")));
+        assert!(lines.iter().any(|l| l.contains("已中断")));
+        assert!(lines.last().unwrap().contains("被中断"));
+    }
+
+    #[test]
+    fn copy_errors_are_reported_separately() {
+        let mut summary = base();
+        summary.copy_errors = 3;
+        let lines = render(&summary);
+        assert!(lines.iter().any(|l| l.contains("复制报错 3 个")));
     }
 }

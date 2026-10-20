@@ -15,19 +15,11 @@ pub struct Entry {
     pub rel: RelPath,
     pub size: u64,
     pub mtime: Option<SystemTime>,
-    pub mode: u32,
-}
-
-#[derive(Clone, Debug)]
-pub struct DirRec {
-    pub rel: RelPath,
-    pub mode: u32,
 }
 
 #[derive(Debug, Default)]
 pub struct Manifest {
     pub files: Vec<Entry>,
-    pub dirs: Vec<DirRec>,
     pub total_bytes: u64,
     pub skipped_symlinks: usize,
     pub skipped_special: usize,
@@ -72,7 +64,6 @@ pub fn scan_with_progress(
     let mut manifest = Manifest::default();
     let mut seen = 0usize;
     let mut pending: Vec<PathBuf> = vec![PathBuf::new()];
-    let mut dirs: Vec<DirRec> = Vec::new();
 
     while let Some(rel_dir) = pending.pop() {
         let abs = if rel_dir.as_os_str().is_empty() {
@@ -133,7 +124,9 @@ pub fn scan_with_progress(
             }
             if looks_like_tmp(&name) {
                 manifest.conflicts.push(format!(
-                    "源文件名与暂存文件规则冲突（以 . 开头并以 {} 结尾）：{}",
+                    "源文件名与暂存文件规则冲突（形如 {}{}{}）：{}",
+                    crate::paths::TMP_PREFIX,
+                    "xxxxxxxx",
                     crate::paths::TMP_SUFFIX,
                     rel.display()
                 ));
@@ -144,10 +137,6 @@ pub fn scan_with_progress(
                 progress(manifest.files.len());
             }
             if file_type.is_dir() {
-                dirs.push(DirRec {
-                    mode: mode_of(&meta),
-                    rel,
-                });
                 pending.push(child_rel);
             } else if file_type.is_file() {
                 manifest.total_bytes += meta.len();
@@ -155,7 +144,6 @@ pub fn scan_with_progress(
                     rel,
                     size: meta.len(),
                     mtime: meta.modified().ok(),
-                    mode: mode_of(&meta),
                 });
             } else {
                 manifest.skipped_special += 1;
@@ -163,14 +151,8 @@ pub fn scan_with_progress(
         }
     }
 
-    // 目录按深度升序（父目录先建），文件与目录按路径排序，保证多次运行顺序一致。
-    dirs.sort_by(|a, b| {
-        let da = a.rel.as_path().components().count();
-        let db = b.rel.as_path().components().count();
-        da.cmp(&db).then_with(|| a.rel.cmp(&b.rel))
-    });
+    // 文件按路径排序，保证多次运行顺序一致。
     manifest.files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    manifest.dirs = dirs;
     progress(manifest.files.len());
     Ok(manifest)
 }
@@ -233,59 +215,6 @@ fn mtime_changed(before: Option<SystemTime>, after: Option<SystemTime>) -> bool 
     }
 }
 
-/// 按清单创建目录（父目录在前）。目录权限暂时放宽，保证能写入，末尾再恢复精确权限。
-pub fn create_dirs(target: &Path, dirs: &[DirRec]) -> io::Result<()> {
-    for dir in dirs {
-        let abs = target.join(dir.rel.as_path());
-        fs::create_dir_all(&abs)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // 复制期间需要写权限，源目录若是只读，稍后由 restore_dir_modes 收尾。
-            let mode = (dir.mode & 0o7777) | 0o700;
-            let _ = fs::set_permissions(&abs, fs::Permissions::from_mode(mode));
-        }
-    }
-    Ok(())
-}
-
-/// 全部校验完成后恢复目录的原始权限。失败只警告，不改变任务结论。
-pub fn restore_dir_modes(target: &Path, dirs: &[DirRec]) -> Vec<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut warnings = Vec::new();
-        // 倒序处理，避免父目录先变只读后导致子目录无法修改。
-        for dir in dirs.iter().rev() {
-            let abs = target.join(dir.rel.as_path());
-            if let Err(err) =
-                fs::set_permissions(&abs, fs::Permissions::from_mode(dir.mode & 0o7777))
-            {
-                warnings.push(format!("恢复目录权限失败 {}：{err}", abs.display()));
-            }
-        }
-        warnings
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, dirs);
-        Vec::new()
-    }
-}
-
-pub fn mode_of(meta: &fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.mode() & 0o7777
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        0o644
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_collects_files_and_dirs() {
+    fn scan_collects_files() {
         let src = tmpdir();
         let dst = tmpdir();
         fs::create_dir_all(src.path().join("a/b")).unwrap();
@@ -307,8 +236,6 @@ mod tests {
         let manifest = scan(src.path(), dst.path()).unwrap();
         assert_eq!(manifest.file_count(), 2);
         assert_eq!(manifest.total_bytes, 6);
-        assert!(manifest.dirs.iter().any(|d| d.rel.display() == "a/b"));
-        assert!(manifest.dirs.iter().any(|d| d.rel.display() == "empty"));
         assert!(manifest.errors.is_empty());
         let rels: Vec<String> = manifest.files.iter().map(|f| f.rel.display()).collect();
         assert_eq!(rels, vec!["a/b/c.MOV".to_string(), "top.txt".to_string()]);
@@ -331,7 +258,7 @@ mod tests {
     fn scan_flags_tmp_name_conflict() {
         let src = tmpdir();
         let dst = tmpdir();
-        let mut f = fs::File::create(src.path().join(".x.MOV.rcptmp")).unwrap();
+        let mut f = fs::File::create(src.path().join(".sy-0badc0de.tmp")).unwrap();
         f.write_all(b"x").unwrap();
         let manifest = scan(src.path(), dst.path()).unwrap();
         assert!(!manifest.conflicts.is_empty());

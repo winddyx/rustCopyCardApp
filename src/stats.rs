@@ -33,11 +33,7 @@ impl FailureLog {
 /// 三个线程共享的运行状态。
 pub struct Stats {
     pub read_bytes: AtomicU64,
-    pub written_bytes: AtomicU64,
     pub hashed_bytes: AtomicU64,
-    pub in_flight_bytes: AtomicU64,
-    pub files_ok: AtomicUsize,
-    pub files_failed: AtomicUsize,
     pub files_skipped: AtomicUsize,
     pub verify_ok: AtomicUsize,
     pub verify_bad: AtomicUsize,
@@ -58,11 +54,7 @@ impl Stats {
     pub fn new() -> Self {
         Self {
             read_bytes: AtomicU64::new(0),
-            written_bytes: AtomicU64::new(0),
             hashed_bytes: AtomicU64::new(0),
-            in_flight_bytes: AtomicU64::new(0),
-            files_ok: AtomicUsize::new(0),
-            files_failed: AtomicUsize::new(0),
             files_skipped: AtomicUsize::new(0),
             verify_ok: AtomicUsize::new(0),
             verify_bad: AtomicUsize::new(0),
@@ -84,16 +76,15 @@ impl Stats {
         self.current.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// 只记录一条失败样例，不增加失败计数（用于跳过等已在其它计数中统计的情况）。
+    /// 记录一条失败。
     pub fn note_failure(&self, message: String) {
         if let Ok(mut log) = self.failures.lock() {
             log.record(message);
         }
     }
 
-    /// 记录一条失败，并同步累计失败文件数。
+    /// 记录一条失败。
     pub fn record_failure(&self, message: String) {
-        self.files_failed.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut log) = self.failures.lock() {
             log.record(message);
         }
@@ -249,7 +240,7 @@ mod tests {
         }
         assert_eq!(stats.failure_count(), 100);
         assert_eq!(stats.failure_examples().len(), MAX_FAILURE_EXAMPLES);
-        assert_eq!(stats.files_failed.load(Ordering::Relaxed), 100);
+        assert_eq!(stats.failure_count(), 100);
     }
 
     #[test]

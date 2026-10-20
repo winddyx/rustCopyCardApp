@@ -1,4 +1,4 @@
-//! 端到端流程测试：正常复制、覆盖、布局、串行模式、输出模式。
+//! 端到端流程测试：正常复制、覆盖、镜像删除、布局、输出模式。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,7 +43,6 @@ fn build_source() -> TempDir {
     write_file(root, "100MEDIA/camera_A002.MOV", &vec![9u8; 1234]);
     write_file(root, "sub/照片_0001.JPG", b"cjk-name-payload");
     write_file(root, "empty.bin", b"");
-    fs::create_dir_all(root.join("empty_dir")).unwrap();
     dir
 }
 
@@ -51,9 +50,7 @@ fn build_source() -> TempDir {
 fn copies_tree_and_verifies() {
     let src = build_source();
     let dst = TempDir::new().unwrap();
-    let mut cmd = rcca();
-    cmd.arg(src.path()).arg(dst.path());
-    let output = cmd.output().unwrap();
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -70,25 +67,24 @@ fn copies_tree_and_verifies() {
         let b = fs::read(dst.path().join(rel)).unwrap();
         assert_eq!(a, b, "{rel} 内容不一致");
     }
-    assert!(dst.path().join("empty_dir").is_dir(), "空目录应被创建");
 
     let leftovers: Vec<PathBuf> = collect_files(dst.path())
         .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with(".rcptmp")
-        })
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(".sy-"))
         .collect();
-    assert!(leftovers.is_empty(), "不应残留暂存文件：{leftovers:?}");
+    assert!(leftovers.is_empty(), "不应残留 sy 暂存文件：{leftovers:?}");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("校验通过 4 个"), "输出：{stdout}");
+    assert!(
+        stdout.contains("校验（XXH64）：通过 4 个"),
+        "输出：{stdout}"
+    );
+    assert!(stdout.contains("复制（sy）：新建 4 个"), "输出：{stdout}");
+    assert!(stdout.contains("全部文件已复制"), "输出：{stdout}");
 }
 
 #[test]
-fn overwrites_existing_file_atomically() {
+fn overwrites_existing_file() {
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();
     write_file(src.path(), "a.bin", b"new-content");
@@ -97,6 +93,23 @@ fn overwrites_existing_file_atomically() {
     rcca().arg(src.path()).arg(dst.path()).assert().success();
 
     assert_eq!(fs::read(dst.path().join("a.bin")).unwrap(), b"new-content");
+}
+
+#[test]
+fn mirror_deletes_target_extras() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "a.bin", b"a");
+    write_file(src.path(), "b.bin", b"b");
+    write_file(dst.path(), "a.bin", b"a");
+    write_file(dst.path(), "b.bin", b"b");
+    write_file(dst.path(), "stale.bin", b"old");
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    assert!(output.status.success());
+    assert!(!dst.path().join("stale.bin").exists(), "镜像应删除多余文件");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("删除 1 个"), "输出：{stdout}");
 }
 
 #[test]
@@ -118,34 +131,7 @@ fn keep_source_name_changes_layout() {
 }
 
 #[test]
-fn serial_io_produces_identical_bytes() {
-    let src = build_source();
-    let a = TempDir::new().unwrap();
-    let b = TempDir::new().unwrap();
-
-    rcca().arg(src.path()).arg(a.path()).assert().success();
-    rcca()
-        .arg(src.path())
-        .arg(b.path())
-        .arg("--serial-io")
-        .assert()
-        .success();
-
-    let files = collect_files(a.path());
-    assert!(!files.is_empty());
-    for path in files {
-        let rel = path.strip_prefix(a.path()).unwrap();
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            fs::read(b.path().join(rel)).unwrap(),
-            "{} 在两种模式下不一致",
-            rel.display()
-        );
-    }
-}
-
-#[test]
-fn quiet_mode_prints_one_line_per_file() {
+fn quiet_mode_prints_only_summary() {
     let src = build_source();
     let dst = TempDir::new().unwrap();
     let output = rcca()
@@ -157,26 +143,29 @@ fn quiet_mode_prints_one_line_per_file() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("COPY 100MEDIA/camera_A001.MOV"),
+        stdout.contains("校验（XXH64）：通过 4 个"),
         "输出：{stdout}"
     );
-    assert!(stdout.contains("COPY sub/照片_0001.JPG"));
     assert!(!stdout.contains("\u{1b}["), "quiet 模式不应有 ANSI 控制符");
+    assert!(!stdout.contains("rcca: 提示"), "quiet 模式不应有提示行");
 }
 
 #[test]
-fn verbose_reports_buffer_details() {
+fn rerun_skips_unchanged_files() {
     let src = build_source();
     let dst = TempDir::new().unwrap();
+    rcca().arg(src.path()).arg(dst.path()).assert().success();
+
     let output = rcca()
         .arg(src.path())
         .arg(dst.path())
-        .arg("--verbose")
+        .arg("--quiet")
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("细节：读速"), "输出：{stdout}");
+    assert!(stdout.contains("新建 0 个"), "第二遍不应重复复制：{stdout}");
+    assert!(stdout.contains("传输 0 B"), "第二遍不应传输数据：{stdout}");
 }
 
 #[test]
@@ -207,18 +196,29 @@ fn preserves_mtime_and_mode() {
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn symlinks_are_skipped() {
+fn symlinks_are_copied_but_not_verified() {
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();
     write_file(src.path(), "real.bin", b"data");
-    #[cfg(unix)]
     std::os::unix::fs::symlink("real.bin", src.path().join("link.bin")).unwrap();
 
     let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
     assert!(output.status.success());
-    assert!(!dst.path().join("link.bin").exists());
-    assert!(dst.path().join("real.bin").exists());
+    let link = dst.path().join("link.bin");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "sy 默认按符号链接复制"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("校验（XXH64）：通过 1 个"),
+        "符号链接不进入校验清单：{stdout}"
+    );
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn clean_stale_removes_leftovers() {
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();
     write_file(src.path(), "a.bin", b"payload");
-    write_file(dst.path(), ".old.MOV.rcptmp", b"stale");
+    write_file(dst.path(), ".sy-1a2b3c4d.tmp", b"stale");
 
     rcca()
         .arg(src.path())
@@ -235,7 +235,7 @@ fn clean_stale_removes_leftovers() {
         .assert()
         .success();
 
-    assert!(!dst.path().join(".old.MOV.rcptmp").exists());
+    assert!(!dst.path().join(".sy-1a2b3c4d.tmp").exists());
 }
 
 #[test]
