@@ -47,6 +47,41 @@ fn build_source() -> TempDir {
 }
 
 #[test]
+fn progress_goes_to_stderr_and_summary_to_stdout() {
+    let src = build_source();
+    let dst = TempDir::new().unwrap();
+    let output = rcca()
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--color")
+        .arg("always")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // 管道下没有 TTY：只允许一行开场与一行复制结果，不允许逐帧刷新。
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "stdout 不应带控制序列：{stdout}"
+    );
+    assert!(
+        !stderr.contains("\u{1b}["),
+        "非 TTY 时不应绘制逐帧界面：{stderr}"
+    );
+    assert!(!stderr.contains('\r'), "非 TTY 时不应回车刷新：{stderr}");
+
+    // 结果在 stdout，进度与提示在 stderr。
+    assert!(stdout.contains("结论："), "汇总应在 stdout：{stdout}");
+    assert!(
+        stderr.contains("rcca: 复制"),
+        "进度提示应在 stderr：{stderr}"
+    );
+}
+
+#[test]
 fn copies_tree_and_verifies() {
     let src = build_source();
     let dst = TempDir::new().unwrap();

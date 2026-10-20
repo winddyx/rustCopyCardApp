@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use rcca::cli::Cli;
+use rcca::cli::{Cli, ColorChoice};
 use rcca::engine::{self, Options as EngineOptions};
 use rcca::error::{Error, Result};
 use rcca::paths;
@@ -36,7 +36,7 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let started = Instant::now();
     let stats = Arc::new(Stats::new());
-    let mut ui = Ui::new(cli.quiet);
+    let mut ui = Ui::new(cli.quiet, color_enabled(cli.color), ascii_output(cli.ascii));
 
     // ---------- 阶段 1：参数与卷预检 ----------
     let source = fs::canonicalize(&cli.source).map_err(|err| {
@@ -189,9 +189,9 @@ fn run(cli: Cli) -> Result<i32> {
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
     if !cli.quiet {
         // sy 的进度条以 finish_with_message 收尾，不会补换行，先断开它的最后一行，
-        // 再补一行中文结果与空行，使校验界面从干净的一行开始。
-        println!();
-        println!(
+        // 再补一行中文结果与空行，使校验界面从干净的一行开始。进度一律写 stderr。
+        eprintln!();
+        eprintln!(
             "rcca: 复制完成（sy）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
             copy.files_created,
             copy.files_updated,
@@ -199,7 +199,7 @@ fn run(cli: Cli) -> Result<i32> {
             copy.files_deleted,
             human_bytes(copy.bytes_transferred)
         );
-        println!();
+        eprintln!();
     }
     for err in &copy.errors {
         stats.note_failure(format!(
@@ -213,6 +213,7 @@ fn run(cli: Cli) -> Result<i32> {
     // ---------- 阶段 4：rcca 遍历并逐文件 XXH64 校验 ----------
     // 复制阶段不拦截 Ctrl-C（交给内嵌 sy 自行结束），校验阶段才接管。
     install_signal_handler(&stats);
+    ui.set_copy_totals(manifest.files.len() as u64, manifest.total_bytes);
     ui.set_total_bytes(manifest.total_bytes);
     ui.set_phase(Phase::Verify, manifest.files.len() as u64);
 
@@ -287,6 +288,29 @@ fn run(cli: Cli) -> Result<i32> {
     } else {
         Ok(1)
     }
+}
+
+/// 颜色策略：显式开关优先，其次 NO_COLOR、TERM=dumb 与非 TTY。
+fn color_enabled(choice: ColorChoice) -> bool {
+    match choice {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => {
+            if std::env::var_os("NO_COLOR").is_some() {
+                return false;
+            }
+            if matches!(std::env::var("TERM").as_deref(), Ok("dumb")) {
+                return false;
+            }
+            std::io::IsTerminal::is_terminal(&std::io::stderr())
+        }
+    }
+}
+
+/// 是否只能用 ASCII 字形：显式开关或 TERM=dumb。不猜本地化环境——多数终端是 UTF-8，
+/// 但 LANG 常为空，按 locale 判断会误回退。
+fn ascii_output(flag: bool) -> bool {
+    flag || matches!(std::env::var("TERM").as_deref(), Ok("dumb"))
 }
 
 fn install_signal_handler(stats: &Arc<Stats>) {

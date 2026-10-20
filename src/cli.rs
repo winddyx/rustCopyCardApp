@@ -2,7 +2,18 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// 进度与状态的颜色策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ColorChoice {
+    /// 交给环境判断（NO_COLOR、TERM、TTY）
+    Auto,
+    /// 始终上色
+    Always,
+    /// 从不上色
+    Never,
+}
 
 /// 相机存储卡复制工具：sy 镜像复制 + XXH64 校验。
 #[derive(Debug, Parser)]
@@ -55,6 +66,14 @@ pub struct Cli {
     /// 开始前清理目标卷上遗留的 .sy-*.tmp 暂存文件
     #[arg(long)]
     pub clean_stale: bool,
+
+    /// 进度行的颜色策略（默认按 NO_COLOR、TERM 与 TTY 判断）
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+    pub color: ColorChoice,
+
+    /// 进度行只用 ASCII 字形（终端不支持 UTF-8 或需要记录纯文本时使用）
+    #[arg(long)]
+    pub ascii: bool,
 }
 
 #[cfg(test)]
@@ -64,11 +83,22 @@ mod tests {
     #[test]
     fn cli_parses_defaults() {
         let cli = Cli::try_parse_from(["rcca", "src", "dst"]).unwrap();
+        assert_eq!(cli.color, ColorChoice::Auto);
+        assert!(!cli.ascii);
         assert!(!cli.keep_source_name);
         assert!(!cli.skip_unreadable);
         assert!(!cli.fail_fast);
         assert!(!cli.quiet);
         assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn color_and_ascii_flags_parse() {
+        let cli =
+            Cli::try_parse_from(["rcca", "src", "dst", "--color", "never", "--ascii"]).unwrap();
+        assert_eq!(cli.color, ColorChoice::Never);
+        assert!(cli.ascii);
+        assert!(Cli::try_parse_from(["rcca", "src", "dst", "--color", "sometimes"]).is_err());
     }
 
     #[test]
