@@ -1,13 +1,14 @@
-//! 四行自适应终端界面：进度条、阶段与计数、状态行、当前文件。
+//! 四行自适应终端界面：进度条、阶段与速率、当前文件、状态。
 //!
-//! 宽度不足时按固定优先级丢弃字段；非 tty 或 `--quiet` 时不绘制进度条。
+//! 阶段行与状态行按固定列宽渲染成表格，数值增长不会移动列位置；
+//! 终端宽度不足时按优先级丢弃整列，单元格内容超长时在单元格内截断。
 
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::stats::{eta_seconds, human_bytes, human_duration, human_speed, SpeedMeter, Stats};
+use crate::stats::{eta_seconds, human_bytes, human_duration, speed_parts, SpeedMeter, Stats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -50,7 +51,74 @@ pub struct Snapshot {
     pub verify_bad: u64,
 }
 
-/// 纯函数渲染，便于单元测试。返回值固定为 4 行。
+/// 单元格对齐方式。
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+}
+
+/// 固定宽度的表格单元格：列位置不随内容长度变化，内容超长时在单元格内截断。
+struct Cell {
+    text: String,
+    width: usize,
+    align: Align,
+    /// 宽度不足时优先丢弃优先级低的列。
+    priority: u8,
+}
+
+impl Cell {
+    fn left(text: String, width: usize, priority: u8) -> Self {
+        Self {
+            text,
+            width,
+            align: Align::Left,
+            priority,
+        }
+    }
+
+    fn right(text: String, width: usize, priority: u8) -> Self {
+        Self {
+            text,
+            width,
+            align: Align::Right,
+            priority,
+        }
+    }
+}
+
+/// 把单元格内容裁剪或补齐到固定显示宽度。
+fn fit_cell(cell: &Cell) -> String {
+    let truncated = truncate_end(&cell.text, cell.width);
+    let pad = cell.width.saturating_sub(truncated.width());
+    match cell.align {
+        Align::Left => format!("{truncated}{}", " ".repeat(pad)),
+        Align::Right => format!("{}{truncated}", " ".repeat(pad)),
+    }
+}
+
+/// 依次拼接单元格；宽度不足时按优先级丢弃整列，仍超宽则整行截断。
+fn build_row(mut cells: Vec<Cell>, max_width: usize) -> String {
+    if cells.is_empty() {
+        return String::new();
+    }
+    loop {
+        let line = cells.iter().map(fit_cell).collect::<Vec<_>>().join("  ");
+        if line.width() <= max_width || cells.len() == 1 {
+            return truncate_end(&line, max_width);
+        }
+        let lowest = cells
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, cell)| cell.priority)
+            .map(|(index, _)| index)
+            .unwrap_or(cells.len() - 1);
+        cells.remove(lowest);
+    }
+}
+
+/// 纯函数渲染，便于单元测试。返回值固定为 4 行：
+/// 进度条、阶段与速率（表格）、当前文件、状态（表格）。
 pub fn render(snapshot: &Snapshot, width: usize) -> Vec<String> {
     let width = width.max(20);
     let percent = snapshot.percent.clamp(0.0, 1.0);
@@ -69,15 +137,16 @@ pub fn render(snapshot: &Snapshot, width: usize) -> Vec<String> {
     }
     let line1 = truncate_end(&format!("[{bar}] {:>5.1}%", percent * 100.0), width);
 
-    let line2 = truncate_end(&render_progress_line(snapshot, width), width);
-    let line3 = truncate_end(&render_status_line(snapshot, width), width);
+    let line2 = render_progress_line(snapshot, width);
 
     let path_prefix = "> ";
     let available = width.saturating_sub(path_prefix.width());
-    let line4 = format!(
+    let line3 = format!(
         "{path_prefix}{}",
         truncate_start(&snapshot.current, available)
     );
+
+    let line4 = render_status_line(snapshot, width);
 
     vec![line1, line2, line3, line4]
 }
@@ -92,75 +161,85 @@ fn bar_width(width: usize) -> usize {
 }
 
 fn render_progress_line(snapshot: &Snapshot, width: usize) -> String {
-    let phase = snapshot.phase.label();
     let counts = if snapshot.files_total > 0 {
         format!("{}/{} files", snapshot.files_done, snapshot.files_total)
     } else {
         format!("{} files", snapshot.files_done)
     };
-    let has_bytes = matches!(snapshot.phase, Phase::Copy | Phase::Verify);
-    let bytes = format!(
-        "{}/{}",
-        human_bytes(snapshot.bytes_done),
-        human_bytes(snapshot.bytes_total)
-    );
-    let read = format!("R {}", human_speed(snapshot.read_speed));
-    let write = format!("W {}", human_speed(snapshot.write_speed));
-    let eta = snapshot
-        .eta
-        .map(|s| format!("ETA {}", human_duration(s)))
-        .unwrap_or_default();
 
-    let mut parts: Vec<String> = vec![phase.to_string()];
-    if width >= 44 {
-        parts.push(counts);
+    let mut cells = vec![
+        Cell::left(snapshot.phase.label().to_string(), 4, 100),
+        Cell::right(counts, 20, 80),
+    ];
+
+    if matches!(snapshot.phase, Phase::Copy | Phase::Verify) {
+        cells.push(Cell::right(
+            format!(
+                "{}/{}",
+                human_bytes(snapshot.bytes_done),
+                human_bytes(snapshot.bytes_total)
+            ),
+            19,
+            60,
+        ));
     }
-    if width >= 60 && has_bytes {
-        parts.push(bytes);
+
+    // 速度只在复制与校验阶段有意义；写速只在复制阶段出现。
+    if matches!(snapshot.phase, Phase::Copy | Phase::Verify) {
+        let (read_value, read_unit) = speed_parts(snapshot.read_speed);
+        cells.push(Cell::left(
+            format!("R {read_value:>6.1} {read_unit:>3}/s"),
+            14,
+            40,
+        ));
     }
-    if width >= 72 {
-        parts.push(read);
+    if snapshot.phase == Phase::Copy {
+        let (write_value, write_unit) = speed_parts(snapshot.write_speed);
+        cells.push(Cell::left(
+            format!("W {write_value:>6.1} {write_unit:>3}/s"),
+            14,
+            30,
+        ));
     }
-    if width >= 90 {
-        parts.push(write);
+
+    if let Some(eta) = snapshot.eta {
+        cells.push(Cell::left(
+            format!("ETA {:>8}", human_duration(eta)),
+            12,
+            20,
+        ));
     }
-    if width >= 110 && !eta.is_empty() {
-        parts.push(eta);
-    }
-    parts.join("  ")
+
+    build_row(cells, width)
 }
 
 fn render_status_line(snapshot: &Snapshot, width: usize) -> String {
-    let elapsed = format!("elapsed {}", human_duration(snapshot.elapsed.as_secs()));
-    match snapshot.phase {
-        Phase::Verify => {
-            let mut parts = vec![
-                format!("match {}", snapshot.verify_ok),
-                format!("mismatch {}", snapshot.verify_bad),
-            ];
-            if width >= 60 {
-                parts.push(elapsed);
-            }
-            parts.join("  ")
-        }
-        _ => {
-            let mut parts = Vec::new();
-            if width >= 72 {
-                parts.push(format!(
-                    "buf {}/{}",
-                    human_bytes(snapshot.buffer_used),
-                    human_bytes(snapshot.buffer_bytes)
-                ));
-            }
-            parts.push(format!("ok {}", snapshot.ok));
-            parts.push(format!("fail {}", snapshot.fail));
-            parts.push(format!("skip {}", snapshot.skip));
-            if width >= 60 {
-                parts.push(elapsed);
-            }
-            parts.join("  ")
-        }
-    }
+    let elapsed = format!("elapsed {:>9}", human_duration(snapshot.elapsed.as_secs()));
+
+    let cells = match snapshot.phase {
+        Phase::Verify => vec![
+            Cell::left(format!("match {:>6}", snapshot.verify_ok), 12, 100),
+            Cell::left(format!("mismatch {:>6}", snapshot.verify_bad), 15, 100),
+            Cell::left(elapsed, 17, 60),
+        ],
+        _ => vec![
+            Cell::left(
+                format!(
+                    "buf {:>4}/{:>4} MiB",
+                    snapshot.buffer_used / (1024 * 1024),
+                    snapshot.buffer_bytes / (1024 * 1024)
+                ),
+                17,
+                40,
+            ),
+            Cell::left(format!("ok {:>6}", snapshot.ok), 9, 100),
+            Cell::left(format!("fail {:>6}", snapshot.fail), 11, 100),
+            Cell::left(format!("skip {:>6}", snapshot.skip), 11, 80),
+            Cell::left(elapsed, 17, 60),
+        ],
+    };
+
+    build_row(cells, width)
 }
 
 fn truncate_end(s: &str, max_width: usize) -> String {
@@ -483,31 +562,82 @@ mod tests {
     }
 
     #[test]
-    fn renders_exactly_four_lines() {
+    fn renders_four_lines_with_status_after_current_file() {
         let lines = render(&snapshot(Phase::Copy, 0.66), 120);
         assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("66.0%"));
         assert!(lines[1].starts_with("COPY"));
-        assert!(lines[2].contains("buf"));
-        assert!(lines[3].starts_with("> 100MEDIA/"));
+        assert!(
+            lines[2].starts_with("> 100MEDIA/"),
+            "当前文件应在状态行之上"
+        );
+        assert!(lines[3].contains("buf"), "状态行应在当前文件之下");
     }
 
     #[test]
-    fn degrades_fields_as_width_shrinks() {
+    fn status_columns_do_not_shift_when_counters_grow() {
+        let mut small = snapshot(Phase::Copy, 0.5);
+        small.ok = 9;
+        small.files_done = 9;
+        let mut large = small.clone_shallow();
+        large.ok = 123456;
+        large.files_done = 123456;
+        large.files_total = 654321;
+        large.elapsed = Duration::from_secs(3 * 3600 + 65);
+
+        let small_lines = render(&small, 120);
+        let large_lines = render(&large, 120);
+
+        assert_eq!(
+            small_lines[3].width(),
+            large_lines[3].width(),
+            "状态行宽度应固定：{small_lines:?} 与 {large_lines:?}"
+        );
+        let small_pos = small_lines[3].find("fail").unwrap();
+        let large_pos = large_lines[3].find("fail").unwrap();
+        assert_eq!(small_pos, large_pos, "fail 列位置不应移动");
+        assert_eq!(
+            small_lines[1].width(),
+            large_lines[1].width(),
+            "阶段行宽度应固定"
+        );
+    }
+
+    #[test]
+    fn cells_are_truncated_when_content_exceeds_width() {
+        let mut snap = snapshot(Phase::Copy, 0.5);
+        snap.ok = u64::MAX;
+        snap.buffer_used = u64::MAX;
+        let lines = render(&snap, 120);
+        assert!(
+            lines[3].contains('…') || lines[3].width() <= 120,
+            "超长单元格应被截断：{}",
+            lines[3]
+        );
+        for line in &lines {
+            assert!(line.width() <= 120);
+        }
+    }
+
+    #[test]
+    fn degrades_columns_as_width_shrinks() {
         let wide = render(&snapshot(Phase::Copy, 0.5), 120).join("\n");
         assert!(wide.contains("ETA"));
         assert!(wide.contains("W "));
         assert!(wide.contains("GiB"));
 
-        let mid = render(&snapshot(Phase::Copy, 0.5), 95).join("\n");
-        assert!(!mid.contains("ETA"));
+        let mid = render(&snapshot(Phase::Copy, 0.5), 90).join("\n");
+        assert!(!mid.contains("ETA"), "宽度不足时先丢 ETA：{mid}");
 
-        let narrow = render(&snapshot(Phase::Copy, 0.5), 65).join("\n");
-        assert!(!narrow.contains("R "));
+        let narrow = render(&snapshot(Phase::Copy, 0.5), 70).join("\n");
+        assert!(!narrow.contains("W "), "继续丢写速：{narrow}");
+
+        let tighter = render(&snapshot(Phase::Copy, 0.5), 55).join("\n");
+        assert!(!tighter.contains("R "), "再丢读速：{tighter}");
 
         let tiny = render(&snapshot(Phase::Copy, 0.5), 30).join("\n");
-        assert!(!tiny.contains("GiB"));
         assert!(tiny.contains('%'));
+        assert!(!tiny.contains("buf"));
     }
 
     #[test]
@@ -529,13 +659,38 @@ mod tests {
         let mut snap = snapshot(Phase::Copy, 0.1);
         snap.current = "素材目录/第一期/相机A_0001.MOV".repeat(4);
         let lines = render(&snap, 40);
-        assert!(lines[3].width() <= 40);
-        assert!(lines[3].ends_with(".MOV"));
+        assert!(lines[2].width() <= 40);
+        assert!(lines[2].ends_with(".MOV"));
     }
 
     #[test]
     fn full_percent_has_no_cursor_marker() {
         let lines = render(&snapshot(Phase::Copy, 1.0), 100);
         assert!(!lines[0].contains('>'));
+    }
+
+    impl Snapshot {
+        fn clone_shallow(&self) -> Snapshot {
+            Snapshot {
+                phase: self.phase,
+                percent: self.percent,
+                files_done: self.files_done,
+                files_total: self.files_total,
+                bytes_done: self.bytes_done,
+                bytes_total: self.bytes_total,
+                read_speed: self.read_speed,
+                write_speed: self.write_speed,
+                eta: self.eta,
+                ok: self.ok,
+                fail: self.fail,
+                skip: self.skip,
+                elapsed: self.elapsed,
+                buffer_used: self.buffer_used,
+                buffer_bytes: self.buffer_bytes,
+                current: self.current.clone(),
+                verify_ok: self.verify_ok,
+                verify_bad: self.verify_bad,
+            }
+        }
     }
 }

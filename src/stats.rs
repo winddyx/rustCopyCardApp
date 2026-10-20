@@ -177,20 +177,33 @@ impl Default for SpeedMeter {
     }
 }
 
-/// 把字节数格式化为便于阅读的单位（二进制前缀）。
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+/// 二进制前缀单位。
+pub const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+/// 把字节数拆成数值与单位，便于界面按固定列宽对齐。
+pub fn human_bytes_parts(bytes: u64) -> (f64, &'static str) {
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
+    while value >= 1024.0 && unit + 1 < BYTE_UNITS.len() {
         value /= 1024.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{bytes} B")
+    (value, BYTE_UNITS[unit])
+}
+
+/// 把字节数格式化为便于阅读的单位（二进制前缀）。
+pub fn human_bytes(bytes: u64) -> String {
+    let (value, unit) = human_bytes_parts(bytes);
+    if unit == "B" {
+        format!("{} {unit}", value.round() as u64)
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        format!("{value:.1} {unit}")
     }
+}
+
+/// 速率同样拆成数值与单位。
+pub fn speed_parts(bytes_per_sec: f64) -> (f64, &'static str) {
+    human_bytes_parts(bytes_per_sec.max(0.0).round() as u64)
 }
 
 pub fn human_speed(bytes_per_sec: f64) -> String {
