@@ -4,6 +4,9 @@
 //! 进度写 stderr，且只在 stderr 是 TTY 时逐帧刷新；stdout 只保留汇总。
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthStr;
@@ -236,6 +239,111 @@ fn compose_row(
         out.push_str(&paint(tail.trim_end(), code, style));
     }
     out.trim_end().to_string()
+}
+
+/// 复制阶段的单行提示：`COPY  当前文件名`。
+///
+/// sy 自身不打印进度，这一行由 rcca 在复制进行时原地刷新。
+pub fn render_copy_line(current: &str, width: usize, style: Style) -> String {
+    let prefix_w = Phase::Copy.label().width() + SEP;
+    let available = width.saturating_sub(prefix_w);
+    let shown = truncate_start(current, available);
+    format!(
+        "{}{}{}",
+        paint(Phase::Copy.label(), SGR_DIM, style),
+        " ".repeat(SEP),
+        shown
+    )
+}
+
+/// 复制阶段的当前文件槽位：sy 的文件回调写入，界面线程读取。
+#[derive(Clone, Default)]
+pub struct CopySlot(Arc<(Mutex<Option<String>>, Condvar)>);
+
+impl CopySlot {
+    /// 记录当前正在复制的文件名，并立刻唤醒界面线程（不必等到下一次轮询）。
+    pub fn set(&self, name: String) {
+        let (lock, cvar) = &*self.0;
+        if let Ok(mut slot) = lock.lock() {
+            *slot = Some(name);
+        }
+        cvar.notify_all();
+    }
+
+    fn notify(&self) {
+        self.0 .1.notify_all();
+    }
+
+    fn current(&self) -> Option<String> {
+        self.0 .0.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// 最多等待 `timeout`，期间若有新文件写入会提前返回。
+    fn wait(&self, timeout: Duration) {
+        let (lock, cvar) = &*self.0;
+        if let Ok(guard) = lock.lock() {
+            let _ = cvar.wait_timeout(guard, timeout);
+        }
+    }
+}
+
+/// 复制阶段的行绘制器：后台线程把当前文件画在同一行，复制结束（或文件不再变化）后擦掉。
+pub struct CopyLine {
+    slot: CopySlot,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CopyLine {
+    /// `enabled` 为假（stderr 非 TTY 或 --quiet）时不绘制也不开线程。
+    pub fn start(slot: CopySlot, enabled: bool, style: Style) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = if enabled {
+            let stop_flag = Arc::clone(&stop);
+            let ticker_slot = slot.clone();
+            Some(std::thread::spawn(move || {
+                let mut drawn = false;
+                let mut last: Option<String> = None;
+                while !stop_flag.load(Ordering::Relaxed) {
+                    if let Some(name) = ticker_slot.current() {
+                        if last.as_deref() != Some(name.as_str()) {
+                            let width = terminal_width().unwrap_or(80);
+                            let line = render_copy_line(&name, width, style);
+                            let mut out = io::stderr().lock();
+                            let _ = write!(out, "\r\x1b[2K{line}");
+                            let _ = out.flush();
+                            drawn = true;
+                            last = Some(name);
+                        }
+                    }
+                    ticker_slot.wait(Duration::from_millis(100));
+                }
+                if drawn {
+                    let mut out = io::stderr().lock();
+                    let _ = write!(out, "\r\x1b[2K");
+                    let _ = out.flush();
+                }
+            }))
+        } else {
+            None
+        };
+        Self { slot, stop, handle }
+    }
+
+    /// 停止刷新并擦掉这一行；`copy_tree` 返回后立即调用，避免与校验界面抢同一行。
+    pub fn finish(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.slot.notify();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CopyLine {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 fn render_file_line(current: &str, width: usize, style: Style) -> String {
@@ -509,6 +617,16 @@ impl Ui {
     pub fn finish(&mut self) {
         self.painter.finish();
     }
+
+    /// 界面是否启用（stderr 是 TTY 且未 --quiet）。
+    pub fn active(&self) -> bool {
+        self.enabled
+    }
+
+    /// 与界面一致的绘制风格，复制阶段的单行提示沿用同一套颜色与字形。
+    pub fn style(&self) -> Style {
+        self.style
+    }
 }
 
 fn terminal_width() -> Option<usize> {
@@ -748,6 +866,22 @@ mod tests {
         let name = lines[2].trim_end();
         assert!(name.ends_with("_0001.MOV"), "保留文件尾名：{name}");
         assert!(lines[2].width() <= 40, "行宽不超宽：{name}");
+    }
+
+    #[test]
+    fn copy_line_shows_the_current_file() {
+        let line = render_copy_line("A001_06141325_C026.mov", 60, Style::PLAIN);
+        assert!(line.starts_with("COPY  "), "{line}");
+        assert!(line.contains("A001_06141325_C026.mov"), "{line}");
+        assert!(line.width() <= 60, "{line}");
+
+        let long = render_copy_line(
+            "素材目录_第一期_相机A_0001_很长很长的文件名.MOV",
+            30,
+            Style::PLAIN,
+        );
+        assert!(long.width() <= 30, "{long}");
+        assert!(long.contains("MOV"), "保留扩展名：{long}");
     }
 
     #[test]

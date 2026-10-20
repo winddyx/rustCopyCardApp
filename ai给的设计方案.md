@@ -163,7 +163,9 @@ VRFY  ▕████████▏░░░░░░░░░░░░░░�
 - 宽度来源：每次重绘查询 `terminal_size`，不依赖 SIGWINCH。
 - 非 tty（stderr 被重定向）或 `--quiet`：不绘制界面，也不做逐帧刷新，只有开场提示一行与复制结果一行，随后是汇总。
 - 光标在绘制期间隐藏，结束时恢复，并把已绘制的行清空后交还给汇总输出。
-- 复制阶段的终端输出完全来自 sy，rcca 不叠加界面；vendor 内打了两处输出补丁（只保留一行 `wide_bar` 总进度线、关闭逐文件进度条，见 `vendor/sy/PATCHES.md`）。sy 的进度条以 `finish_with_message("Sync complete")` 收尾且不补换行，因此复制结束后 rcca 先换行，再补一行中文复制结果与一个空行，校验界面从干净的一行开始绘制。
+- 复制阶段不显示进度条：sy 的扫描提示、总进度条与逐文件进度条全部关闭（`quiet=true`、`progress=false`），
+  rcca 只在一行上刷新当前正在复制的文件名（`COPY  <文件>`）。文件名来自 vendor 内新增的文件开始回调，
+  见 `vendor/sy/PATCHES.md`。sy 的进度条以 `finish_with_message("Sync complete")` 收尾且不补换行，因此复制结束后 rcca 先换行，再补一行中文复制结果与一个空行，校验界面从干净的一行开始绘制。
 
 ## 8. 错误模型与退出码
 

@@ -268,7 +268,12 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         dest: &Path,
         file_size: u64,
     ) -> Result<TransferResult> {
-        use crate::sync::progress::{create_progress_callback, MIN_SIZE_FOR_PROGRESS};
+        use crate::sync::progress::{
+            create_progress_callback, notify_file_started, MIN_SIZE_FOR_PROGRESS,
+        };
+
+        // rcca 补丁：每个文件开始复制时通知宿主，用于显示"当前文件"。
+        notify_file_started(source);
 
         // Ensure parent directory exists
         if let Some(parent) = dest.parent() {

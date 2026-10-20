@@ -712,7 +712,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template(
-                        "{spinner:.green} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
+                        "{msg}\n{spinner:.green} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
                     )
                     .expect("built-in template is valid")
                     .progress_chars("#>-"),

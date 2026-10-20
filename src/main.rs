@@ -15,7 +15,7 @@ use rcca::paths;
 use rcca::report::{self, Summary};
 use rcca::scan;
 use rcca::stats::{human_bytes, Stats};
-use rcca::ui::{Phase, Ui};
+use rcca::ui::{CopyLine, CopySlot, Phase, Ui};
 use rcca::verify;
 
 /// 校验阶段每次读取的块大小。
@@ -182,15 +182,24 @@ fn run(cli: Cli) -> Result<i32> {
     }
     let engine_opts = EngineOptions {
         delete: true,
-        quiet: cli.quiet,
-        progress: !cli.quiet,
         max_errors: cli.fail_fast.then_some(1),
     };
+
+    // 复制阶段只报当前文件：sy 不打印任何进度，这一行由 rcca 原地刷新。
+    let copy_slot = CopySlot::default();
+    {
+        let slot = copy_slot.clone();
+        engine::set_file_observer(move |path| {
+            if let Some(name) = path.file_name() {
+                slot.set(name.to_string_lossy().into_owned());
+            }
+        });
+    }
+    let mut copy_line = CopyLine::start(copy_slot, ui.active(), ui.style());
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
+    copy_line.finish();
+
     if !cli.quiet {
-        // sy 的进度条以 finish_with_message 收尾，不会补换行，先断开它的最后一行，
-        // 再补一行中文结果与空行，使校验界面从干净的一行开始。进度一律写 stderr。
-        eprintln!();
         eprintln!(
             "rcca: 复制完成（sy）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
             copy.files_created,

@@ -20,31 +20,36 @@ const DELETE_THRESHOLD: u8 = 50;
 pub struct Options {
     /// 删除目标中源里不存在的文件（镜像语义）。
     pub delete: bool,
-    /// 抑制 sy 自身的输出（对应 rcca 的 --quiet）。
-    pub quiet: bool,
-    /// 显示 sy 的逐文件进度。
-    pub progress: bool,
     /// 出错上限，用于实现 --fail-fast。
     pub max_errors: Option<usize>,
 }
 
 impl Options {
-    /// 默认镜像参数：保留删除镜像语义，输出随 rcca 的安静/详细设置。
-    pub fn mirror(quiet: bool) -> Self {
+    /// 默认镜像参数：保留删除镜像语义，其余按上游默认。
+    pub fn mirror() -> Self {
         Self {
             delete: true,
-            quiet,
-            progress: !quiet,
             max_errors: None,
         }
     }
 }
 
+/// 注册"某个文件开始复制"的回调，界面用它显示当前文件。
+///
+/// sy 自身不打印任何进度：复制阶段的可见输出全部由 rcca 负责。
+pub fn set_file_observer<F>(observer: F)
+where
+    F: Fn(&Path) + Send + Sync + 'static,
+{
+    sy::sync::progress::set_file_observer(Box::new(observer));
+}
+
 /// 把源目录内容同步到目标目录，返回 sy 的统计。
 pub fn copy_tree(source: &Path, target: &Path, opts: &Options) -> Result<SyncStats> {
     let mut config = SyncConfig::test_default();
-    config.quiet = opts.quiet;
-    config.progress = opts.progress;
+    // sy 只负责搬数据：进度条、扫描提示与逐文件进度全部关闭，界面对外由 rcca 绘制。
+    config.quiet = true;
+    config.progress = false;
     config.delete = if opts.delete {
         DeleteMode::Enabled {
             threshold: DELETE_THRESHOLD,
@@ -74,15 +79,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mirror_options_enable_delete_and_progress() {
-        let opts = Options::mirror(false);
+    fn mirror_options_enable_delete() {
+        let opts = Options::mirror();
         assert!(opts.delete);
-        assert!(!opts.quiet);
-        assert!(opts.progress);
+        assert!(opts.max_errors.is_none());
+    }
 
-        let quiet = Options::mirror(true);
-        assert!(quiet.quiet);
-        assert!(!quiet.progress);
+    #[test]
+    fn file_observer_sees_each_copied_file() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        set_file_observer(move |_path| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(src.path().join("b.txt"), b"b").unwrap();
+
+        copy_tree(src.path(), dst.path(), &Options::mirror()).unwrap();
+        assert!(
+            seen.load(Ordering::Relaxed) >= 2,
+            "每个文件都应通知一次：{}",
+            seen.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -94,7 +118,7 @@ mod tests {
         std::fs::write(src.path().join("a/b/clip.MP4"), b"payload").unwrap();
         std::fs::write(src.path().join("root.txt"), b"root").unwrap();
 
-        let stats = copy_tree(src.path(), dst.path(), &Options::mirror(true)).unwrap();
+        let stats = copy_tree(src.path(), dst.path(), &Options::mirror()).unwrap();
 
         // 源目录的内容落在目标根目录下，而不是再套一层源目录名。
         assert_eq!(
@@ -117,7 +141,7 @@ mod tests {
         std::fs::write(dst.path().join("keep2.txt"), b"2").unwrap();
         std::fs::write(dst.path().join("stale.txt"), b"old").unwrap();
 
-        let stats = copy_tree(src.path(), dst.path(), &Options::mirror(true)).unwrap();
+        let stats = copy_tree(src.path(), dst.path(), &Options::mirror()).unwrap();
 
         assert!(!dst.path().join("stale.txt").exists(), "多余文件应被删除");
         assert_eq!(stats.files_deleted, 1);
@@ -130,7 +154,7 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(dst.path().join("stale.txt"), b"old").unwrap();
 
-        let err = copy_tree(src.path(), dst.path(), &Options::mirror(true)).unwrap_err();
+        let err = copy_tree(src.path(), dst.path(), &Options::mirror()).unwrap_err();
         let message = format!("{err}");
         assert!(
             message.contains("Deletion threshold"),

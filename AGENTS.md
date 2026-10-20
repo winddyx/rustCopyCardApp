@@ -21,8 +21,8 @@
 
 - 只保留 `src/`、`Cargo.toml`、`LICENSE`，补丁与升级步骤写在 `vendor/sy/PATCHES.md`。
 - 三处 Windows 补丁（`windows-sys` 的 `Win32_Foundation`、`ssh.rs` 的 `dest_path`、`symlink_file`/`symlink_dir`）
-  是 `x86_64-pc-windows-gnu` 能编译的前提；另有两处输出补丁（总进度条去掉消息行、关闭逐文件进度条），
-  否则复制阶段的进度条会超出终端宽度并互相覆盖。改动 vendor 必须同步 `PATCHES.md`。
+  是 `x86_64-pc-windows-gnu` 能编译的前提；另有一处回调补丁（文件开始复制时通知宿主），
+  让 rcca 关掉 sy 的全部进度输出、自己显示当前文件。改动 vendor 必须同步 `PATCHES.md`。
 - 不向上游提交 PR 或 issue；需要的行为差异就在 `vendor/sy` 内改并记录。
 
 ## 命令
