@@ -52,7 +52,7 @@ pub struct Cli {
     #[arg(long)]
     pub fail_fast: bool,
 
-    /// 不绘制进度条，只输出逐文件结果与汇总
+    /// 不绘制终端界面，只输出逐文件结果与汇总
     #[arg(long, conflicts_with = "verbose")]
     pub quiet: bool,
 
