@@ -9,8 +9,6 @@ pub enum Error {
     Usage(String),
     Preflight(String),
     Copy(String),
-    Verify(String),
-    Interrupted,
 }
 
 impl Error {
@@ -18,8 +16,7 @@ impl Error {
         match self {
             Error::Usage(_) => 2,
             Error::Preflight(_) => 3,
-            Error::Copy(_) | Error::Verify(_) => 1,
-            Error::Interrupted => 130,
+            Error::Copy(_) => 1,
         }
     }
 
@@ -35,20 +32,8 @@ impl Error {
         Error::Copy(msg.into())
     }
 
-    pub fn verify(msg: impl Into<String>) -> Self {
-        Error::Verify(msg.into())
-    }
-
     pub fn preflight_io(context: impl fmt::Display, err: std::io::Error) -> Self {
         Error::Preflight(format!("{context}：{err}"))
-    }
-
-    pub fn copy_io(context: impl fmt::Display, err: std::io::Error) -> Self {
-        Error::Copy(format!("{context}：{err}"))
-    }
-
-    pub fn verify_io(context: impl fmt::Display, err: std::io::Error) -> Self {
-        Error::Verify(format!("{context}：{err}"))
     }
 }
 
@@ -58,8 +43,6 @@ impl fmt::Display for Error {
             Error::Usage(m) => write!(f, "用法错误：{m}"),
             Error::Preflight(m) => write!(f, "预检失败：{m}"),
             Error::Copy(m) => write!(f, "复制失败：{m}"),
-            Error::Verify(m) => write!(f, "校验失败：{m}"),
-            Error::Interrupted => write!(f, "已中断"),
         }
     }
 }

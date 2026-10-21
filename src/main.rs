@@ -1,7 +1,7 @@
 //! rcca 入口：预检与遍历、交给内嵌的 sy 复制、rcca 校验、退出码映射。
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,7 +15,7 @@ use rcca::paths;
 use rcca::report::{self, Summary};
 use rcca::scan;
 use rcca::stats::{human_bytes, Stats};
-use rcca::ui::{self, Phase, ProgressLine, ProgressSlot};
+use rcca::ui::{self, Live, Phase};
 use rcca::verify;
 
 /// 校验阶段每次读取的块大小。
@@ -39,7 +39,8 @@ fn run(cli: Cli) -> Result<i32> {
     let style = ui::Style {
         color: ui::color_enabled(cli.color),
     };
-    let progress_enabled = ui::interactive(cli.quiet);
+    // 运行期只有这一行文字进度：阶段、全程百分比、已完成/总量、当前文件。
+    let (mut live, view) = Live::start(Arc::clone(&stats), ui::interactive(cli.quiet), style);
 
     // ---------- 阶段 1：参数与卷预检 ----------
     let source = fs::canonicalize(&cli.source).map_err(|err| {
@@ -80,14 +81,12 @@ fn run(cli: Cli) -> Result<i32> {
         }
     }
 
-    if !cli.quiet && same_device(&source, &target_root) {
-        eprintln!("rcca: 提示：源与目标在同一文件系统，读写互相争用可能降低吞吐");
-    }
     let fs_type = fs_type_name(&target_root);
 
     // ---------- 阶段 2：遍历 source，检查 target ----------
-    let mut manifest = scan::scan(&source, &target_root)
-        .map_err(|err| Error::preflight_io("遍历源目录失败", err))?;
+    let mut manifest =
+        scan::scan_with_progress(&source, &target_root, &mut |files| view.set_scanned(files))
+            .map_err(|err| Error::preflight_io("遍历源目录失败", err))?;
 
     if !manifest.errors.is_empty() {
         return Err(Error::preflight(format!(
@@ -151,6 +150,7 @@ fn run(cli: Cli) -> Result<i32> {
     }
 
     if manifest.files.is_empty() {
+        live.finish();
         let summary = Summary {
             source: source.clone(),
             target: target_root.clone(),
@@ -173,46 +173,30 @@ fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
 
-    // ---------- 阶段 3：交给内嵌的 sy 引擎复制（输出透传） ----------
-    if !cli.quiet {
-        eprintln!(
-            "rcca: 复制 {} 个文件，共 {}，引擎 sy {}（镜像，删除目标中多余文件）",
-            manifest.files.len(),
-            human_bytes(manifest.total_bytes),
-            engine::VERSION
-        );
-    }
+    // ---------- 阶段 3：交给内嵌的 sy 引擎复制 ----------
+    view.set_total(manifest.total_bytes);
+    view.set_phase(Phase::Copy);
+
     let engine_opts = EngineOptions {
         delete: true,
         max_errors: cli.fail_fast.then_some(1),
     };
-
-    // 复制阶段只报当前文件：sy 不打印任何进度，这一行由 rcca 原地刷新。
-    let copy_slot = ProgressSlot::default();
     {
-        let slot = copy_slot.clone();
+        // sy 不打印任何进度；文件名与字节数通过两个回调交给界面。
+        let stats_for_name = Arc::clone(&stats);
         engine::set_file_observer(move |path| {
             if let Some(name) = path.file_name() {
-                slot.set(name.to_string_lossy().into_owned());
+                stats_for_name.set_current(name.to_string_lossy().into_owned());
             }
         });
+        let stats_for_bytes = Arc::clone(&stats);
+        engine::set_bytes_observer(move |bytes| {
+            stats_for_bytes
+                .copied_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        });
     }
-    let mut copy_line =
-        ProgressLine::start(Phase::Copy.label(), copy_slot, progress_enabled, style);
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
-    copy_line.finish();
-
-    if !cli.quiet {
-        eprintln!(
-            "rcca: 复制完成（sy）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
-            copy.files_created,
-            copy.files_updated,
-            copy.files_skipped,
-            copy.files_deleted,
-            human_bytes(copy.bytes_transferred)
-        );
-        eprintln!();
-    }
     for err in &copy.errors {
         stats.note_failure(format!(
             "复制 {}：{}（{}）",
@@ -232,26 +216,16 @@ fn run(cli: Cli) -> Result<i32> {
         keep_bad: cli.keep_bad,
         no_cache: cli.verify_no_cache,
     };
-    let verify_slot = ProgressSlot::default();
-    let mut verify_line = ProgressLine::start(
-        Phase::Verify.label(),
-        verify_slot.clone(),
-        progress_enabled,
-        style,
+    view.set_phase(Phase::Verify);
+    let verify_report = verify::run(
+        &manifest.files,
+        &indices,
+        &source,
+        &target_root,
+        &verify_opts,
+        &stats,
     );
-    let verify_report = {
-        let mut tick = |stats: &Stats| verify_slot.set(stats.current());
-        verify::run(
-            &manifest.files,
-            &indices,
-            &source,
-            &target_root,
-            &verify_opts,
-            &stats,
-            &mut tick,
-        )
-    };
-    verify_line.finish();
+    live.finish();
 
     let interrupted = stats.cancel.load(Ordering::SeqCst);
     if interrupted {
@@ -348,20 +322,6 @@ fn clean_stale(root: &Path) -> usize {
     removed
 }
 
-#[cfg(unix)]
-fn same_device(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (fs::metadata(a), fs::metadata(b)) {
-        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn same_device(_a: &Path, _b: &Path) -> bool {
-    false
-}
-
 #[cfg(target_os = "macos")]
 fn fs_type_name(path: &Path) -> Option<String> {
     use std::ffi::CString;
@@ -418,14 +378,4 @@ fn free_space(path: &Path) -> Option<u64> {
         let _ = path;
         None
     }
-}
-
-#[allow(dead_code)]
-fn target_display(path: &Path) -> String {
-    path.display().to_string()
-}
-
-#[allow(dead_code)]
-fn join(root: &Path, rel: &Path) -> PathBuf {
-    root.join(rel)
 }

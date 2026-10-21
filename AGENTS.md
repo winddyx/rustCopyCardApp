@@ -21,8 +21,8 @@
 
 - 只保留 `src/`、`Cargo.toml`、`LICENSE`，补丁与升级步骤写在 `vendor/sy/PATCHES.md`。
 - 三处 Windows 补丁（`windows-sys` 的 `Win32_Foundation`、`ssh.rs` 的 `dest_path`、`symlink_file`/`symlink_dir`）
-  是 `x86_64-pc-windows-gnu` 能编译的前提；另有一处回调补丁（文件开始复制时通知宿主），
-  让 rcca 关掉 sy 的全部进度输出、自己显示当前文件。改动 vendor 必须同步 `PATCHES.md`。
+  是 `x86_64-pc-windows-gnu` 能编译的前提；另有回调补丁（文件开始复制时通知宿主、任务处理完
+  上报字节数），让 rcca 关掉 sy 的全部进度输出、自己绘制那一行。改动 vendor 必须同步 `PATCHES.md`。
 - 不向上游提交 PR 或 issue；需要的行为差异就在 `vendor/sy` 内改并记录。
 
 ## 命令
@@ -42,23 +42,22 @@
 
 ## 终端界面（最容易改错的地方）
 
-- 不画进度条。运行期只有两行文字进度，原地刷新：`COPY    <当前文件>` 与 `VERIFY  <当前文件>`。
-- 两行标签都补到 6 列，文件名固定从第 8 列开始；文件名超宽时从头截断，保留扩展名。
-- 进度写 stderr，stdout 只放汇总；stderr 不是 TTY 或 `--quiet` 时不绘制、不开线程。
-- sy 自身的所有进度输出保持关闭（`quiet=true`、`progress=false`），文件名靠 vendor 内的文件开始回调。
-- 标签暗色、文件名默认色；`--color auto|always|never`，`NO_COLOR` 与 `TERM=dumb` 时不上色。
+- 不画进度条，也不显示速度与 ETA。运行期只有一行文字，原地刷新：`标签  百分比  已完成/总量  当前文件`。
+- 百分比分母固定为源总字节的两倍，复制占前一半、校验占后一半；复制阶段分子含被跳过的文件，校验阶段按读过的字节除以二。
+- 标签 `SCAN` / `COPY` / `VERIFY` 都补到 6 列，文件名固定在第八列起；文件名超宽时从头截断，保留扩展名。
+- 进度写 stderr，stdout 只放汇总；stderr 不是 TTY 或 `--quiet` 时不绘制、不开线程，stderr 为空。
+- sy 自身的所有进度输出保持关闭（`quiet=true`、`progress=false`），文件名与字节数靠 vendor 内的两个回调。
+- 复制串行（`max_concurrent = 1`），不要为了吞吐改回并发，否则"当前文件"会在多个文件之间跳。
+- 标签暗色、其余默认色；`--color auto|always|never`，`NO_COLOR` 与 `TERM=dumb` 时不上色。
 
 ## 完成标准
 
 - 改界面、校验或统计后：`make test` 与 `make lint` 全绿，再 `make dist` 确认两个平台产物与 `SHA256SUMS`。
-- 界面改动同步更新 `src/ui.rs` 的单元测试（行数、列位置、降级顺序）与 README、设计文档里的界面样例。
+- 界面改动同步更新 `src/ui.rs` 的单元测试（列位对齐、降级顺序、宽度上限）与 README 里的界面样例。
 - 涉及 sy 语义的改动（镜像删除、跳过、阈值）跑 `tests/cli_flow.rs` 与 `tests/failure_paths.rs`，
   并确认上面列出的退出码没有变化。
 
 ## 文档
 
-- `ai给的设计方案.md` 是架构与流程决策的唯一来源，保持单一方案描述：不写表格，不写版本对照。
-- `TUI设计方案.md` 是终端界面的目标设计（含 `.mock` 帧与取舍依据）。它描述的是待实施状态；
-  落地后同步改写，并把其中已成事实的部分合并回 `ai给的设计方案.md` 的界面章节。
-- `README.md` 面向使用：构建、选项、退出码、界面样例。
-- 行为变化时两份文档与代码一起改，不要只在提交信息里说明。
+- `README.md` 面向使用：构建、选项、退出码、界面样例。不另写设计方案文档，行为以代码为准。
+- 行为变化时 README 与代码一起改，不要只在提交信息里说明。

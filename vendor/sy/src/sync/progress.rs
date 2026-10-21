@@ -35,6 +35,26 @@ pub fn notify_file_started(path: &Path) {
     }
 }
 
+/// rcca 补丁：任务处理完毕的字节数观察者，宿主用它算总进度。
+pub type BytesObserver = dyn Fn(u64) + Send + Sync;
+
+static BYTES_OBSERVER: std::sync::OnceLock<Box<BytesObserver>> = std::sync::OnceLock::new();
+
+/// 注册字节数观察者；重复注册时忽略后一次。
+pub fn set_bytes_observer(observer: Box<BytesObserver>) {
+    let _ = BYTES_OBSERVER.set(observer);
+}
+
+/// 通知观察者某个任务已处理完的字节数（新建、更新与跳过都算）。
+pub fn notify_bytes_accounted(bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    if let Some(observer) = BYTES_OBSERVER.get() {
+        observer(bytes);
+    }
+}
+
 /// Minimum file size (in bytes) to show progress bar
 /// Files smaller than this are transferred too quickly for meaningful progress display
 pub const MIN_SIZE_FOR_PROGRESS: u64 = 1024 * 1024; // 1MB

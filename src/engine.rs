@@ -16,6 +16,12 @@ pub const VERSION: &str = "v0.4.1";
 /// 删除保护阈值（百分比），与上游 `--max-delete 50%` 的默认值一致。
 const DELETE_THRESHOLD: u8 = 50;
 
+/// 串行复制：一次只搬一个文件（对应上游 `-j 1`）。
+///
+/// 显示上一行只有"当前文件"，串行才不会在多个并发文件之间跳；对 U 盘、机械盘
+/// 这类存储，顺序读通常不比并发随机差。
+const PARALLEL_TRANSFERS: usize = 1;
+
 #[derive(Debug, Clone)]
 pub struct Options {
     /// 删除目标中源里不存在的文件（镜像语义）。
@@ -44,12 +50,21 @@ where
     sy::sync::progress::set_file_observer(Box::new(observer));
 }
 
+/// 注册"某个任务已处理完多少字节"的回调，界面用它算全程进度。
+pub fn set_bytes_observer<F>(observer: F)
+where
+    F: Fn(u64) + Send + Sync + 'static,
+{
+    sy::sync::progress::set_bytes_observer(Box::new(observer));
+}
+
 /// 把源目录内容同步到目标目录，返回 sy 的统计。
 pub fn copy_tree(source: &Path, target: &Path, opts: &Options) -> Result<SyncStats> {
     let mut config = SyncConfig::test_default();
     // sy 只负责搬数据：进度条、扫描提示与逐文件进度全部关闭，界面对外由 rcca 绘制。
     config.quiet = true;
     config.progress = false;
+    config.max_concurrent = PARALLEL_TRANSFERS;
     config.delete = if opts.delete {
         DeleteMode::Enabled {
             threshold: DELETE_THRESHOLD,

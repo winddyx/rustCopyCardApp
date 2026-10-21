@@ -1,8 +1,7 @@
-//! 运行统计：原子计数、速度滑窗、有界失败清单、取消与中止标志。
+//! 运行统计：原子字节计数、有界失败清单、取消与中止标志、当前文件。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
 
 /// 失败样例条数上限。
 pub const MAX_FAILURE_EXAMPLES: usize = 32;
@@ -32,7 +31,9 @@ impl FailureLog {
 
 /// 三个线程共享的运行状态。
 pub struct Stats {
-    pub read_bytes: AtomicU64,
+    /// 复制阶段已处理的字节数（新建、更新完成或跳过时累加）。
+    pub copied_bytes: AtomicU64,
+    /// 校验阶段读过的字节数，源与目标两侧都算，所以是文件大小的两倍。
     pub hashed_bytes: AtomicU64,
     pub files_skipped: AtomicUsize,
     pub verify_ok: AtomicUsize,
@@ -53,7 +54,7 @@ impl Default for Stats {
 impl Stats {
     pub fn new() -> Self {
         Self {
-            read_bytes: AtomicU64::new(0),
+            copied_bytes: AtomicU64::new(0),
             hashed_bytes: AtomicU64::new(0),
             files_skipped: AtomicUsize::new(0),
             verify_ok: AtomicUsize::new(0),
@@ -76,15 +77,8 @@ impl Stats {
         self.current.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// 记录一条失败。
+    /// 记录一条失败，条数与明细都受上限约束。
     pub fn note_failure(&self, message: String) {
-        if let Ok(mut log) = self.failures.lock() {
-            log.record(message);
-        }
-    }
-
-    /// 记录一条失败。
-    pub fn record_failure(&self, message: String) {
         if let Ok(mut log) = self.failures.lock() {
             log.record(message);
         }
@@ -155,10 +149,6 @@ pub fn human_duration(seconds: u64) -> String {
     }
 }
 
-pub fn elapsed(seconds: f64) -> Duration {
-    Duration::from_secs_f64(seconds.max(0.0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,7 +157,7 @@ mod tests {
     fn failure_log_is_bounded() {
         let stats = Stats::new();
         for i in 0..100 {
-            stats.record_failure(format!("失败 {i}"));
+            stats.note_failure(format!("失败 {i}"));
         }
         assert_eq!(stats.failure_count(), 100);
         assert_eq!(stats.failure_examples().len(), MAX_FAILURE_EXAMPLES);
@@ -179,7 +169,7 @@ mod tests {
         let stats = Stats::new();
         let long = "x".repeat(4096);
         for _ in 0..100 {
-            stats.record_failure(long.clone());
+            stats.note_failure(long.clone());
         }
         assert!(stats.failure_examples().len() <= MAX_FAILURE_DETAIL_BYTES / 4096 + 1);
     }

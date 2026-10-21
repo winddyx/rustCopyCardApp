@@ -62,23 +62,23 @@ fn progress_goes_to_stderr_and_summary_to_stdout() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // 管道下没有 TTY：只允许一行开场与一行复制结果，不允许逐帧刷新。
+    // 管道下没有 TTY：不绘制进度行，stderr 只剩可能出现的告警。
     assert!(
         !stdout.contains('\u{1b}'),
         "stdout 不应带控制序列：{stdout}"
     );
     assert!(
         !stderr.contains("\u{1b}["),
-        "非 TTY 时不应绘制逐帧界面：{stderr}"
+        "非 TTY 时不应绘制进度行：{stderr}"
     );
     assert!(!stderr.contains('\r'), "非 TTY 时不应回车刷新：{stderr}");
-
-    // 结果在 stdout，进度与提示在 stderr。
-    assert!(stdout.contains("结论："), "汇总应在 stdout：{stdout}");
     assert!(
-        stderr.contains("rcca: 复制"),
-        "进度提示应在 stderr：{stderr}"
+        !stderr.contains("COPY") && !stderr.contains("VERIFY"),
+        "非 TTY 时不应有进度文字：{stderr}"
     );
+
+    // 结果只在 stdout。
+    assert!(stdout.contains("结论："), "汇总应在 stdout：{stdout}");
 }
 
 #[test]

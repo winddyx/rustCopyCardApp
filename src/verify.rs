@@ -32,13 +32,19 @@ pub struct Options {
     pub no_cache: bool,
 }
 
-/// 计算单个文件的 XXH64（seed = 0）。
+/// 计算单个文件的 XXH64（seed = 0），不汇报中间进度。
 pub fn hash_file(path: &Path, chunk: usize, no_cache: bool) -> io::Result<u64> {
     let mut buffer = vec![0u8; chunk];
-    hash_file_with(path, &mut buffer, no_cache)
+    hash_stream(path, &mut buffer, no_cache, &mut |_| {})
 }
 
-pub fn hash_file_with(path: &Path, buffer: &mut [u8], no_cache: bool) -> io::Result<u64> {
+/// 分块读取并计算 XXH64，每读一块调用一次 `on_chunk`（参数是块大小）。
+pub fn hash_stream(
+    path: &Path,
+    buffer: &mut [u8],
+    no_cache: bool,
+    on_chunk: &mut dyn FnMut(u64),
+) -> io::Result<u64> {
     let file = File::open(path)?;
     if no_cache {
         disable_read_cache(&file);
@@ -53,6 +59,7 @@ pub fn hash_file_with(path: &Path, buffer: &mut [u8], no_cache: bool) -> io::Res
             Err(err) => return Err(err),
         };
         hasher.update(&buffer[..n]);
+        on_chunk(n as u64);
     }
     Ok(hasher.digest())
 }
@@ -85,7 +92,6 @@ pub fn run(
     target: &Path,
     opts: &Options,
     stats: &Stats,
-    progress: &mut dyn FnMut(&Stats),
 ) -> VerifyReport {
     let mut report = VerifyReport::default();
     let mut buffer = vec![0u8; opts.chunk];
@@ -105,12 +111,11 @@ pub fn run(
         if !dst.exists() {
             stats.verify_bad.fetch_add(1, Ordering::Relaxed);
             report.missing.push(rel);
-            progress(stats);
             continue;
         }
 
-        let src_hash = hash_with_progress(&src, &mut buffer, opts, stats, progress);
-        let dst_hash = hash_with_progress(&dst, &mut buffer, opts, stats, progress);
+        let src_hash = hash_counted(&src, &mut buffer, opts, stats);
+        let dst_hash = hash_counted(&dst, &mut buffer, opts, stats);
 
         match (src_hash, dst_hash) {
             (Ok(a), Ok(b)) if a == b => {
@@ -149,43 +154,17 @@ pub fn run(
         {
             report.errors.push(format!("{rel}：{}", issue.describe()));
         }
-
-        progress(stats);
     }
 
     report
 }
 
-fn hash_with_progress(
-    path: &Path,
-    buffer: &mut [u8],
-    opts: &Options,
-    stats: &Stats,
-    progress: &mut dyn FnMut(&Stats),
-) -> io::Result<u64> {
-    let file = File::open(path)?;
-    if opts.no_cache {
-        disable_read_cache(&file);
-    }
-    let mut hasher = Xxh64::new(0);
-    let mut reader = io::BufReader::with_capacity(buffer.len(), file);
-    loop {
-        if stats.stop_requested() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "已中断"));
-        }
-        let n = match reader.read(buffer) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-        hasher.update(&buffer[..n]);
-        // 两侧都要读，read_bytes 供界面估算速率，hashed_bytes 供进度与 ETA。
-        stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
-        stats.hashed_bytes.fetch_add(n as u64, Ordering::Relaxed);
-        progress(stats);
-    }
-    Ok(hasher.digest())
+/// 计算哈希并把读过的字节累加进统计，界面据此显示进度。
+fn hash_counted(path: &Path, buffer: &mut [u8], opts: &Options, stats: &Stats) -> io::Result<u64> {
+    let hashed = &stats.hashed_bytes;
+    hash_stream(path, buffer, opts.no_cache, &mut |n| {
+        hashed.fetch_add(n, Ordering::Relaxed);
+    })
 }
 
 #[cfg(test)]
@@ -235,7 +214,6 @@ mod tests {
                 no_cache: false,
             },
             &stats,
-            &mut |_| {},
         );
         assert_eq!(report.matched, 0);
         assert_eq!(report.mismatched.len(), 1);
@@ -264,7 +242,6 @@ mod tests {
                 no_cache: false,
             },
             &stats,
-            &mut |_| {},
         );
         assert_eq!(report.mismatched.len(), 1);
         assert!(dst.path().join(".f.bin.badhash").exists());
