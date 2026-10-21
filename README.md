@@ -15,14 +15,23 @@ sy is vendored as source in `vendor/sy` (v0.4.1, with four small patches documen
 `vendor/sy/PATCHES.md`), so building needs neither network access nor a separate sy
 install.
 
-`make dist` produces five artifacts:
+`make dist` produces nine artifacts:
 
 - `dist/rcca-macos-arm64`: macOS arm64.
 - `dist/rcca-windows-x64.exe`: Windows x64 (PE32+, system DLLs only).
 - `dist/rcca-linux-x64`: Linux x86-64, static musl.
 - `dist/rcca-linux-armv7`: Linux ARMv7 hard-float (Raspberry Pi 2/3 in 32-bit mode), static musl.
 - `dist/rcca-linux-armv8`: Linux ARMv8 / aarch64, static musl.
-- `dist/SHA256SUMS`: SHA-256 of all five, verify with `cd dist && shasum -a 256 -c SHA256SUMS`.
+- `dist/rcca-windows-x64-upx.exe`, `dist/rcca-linux-x64-upx`, `dist/rcca-linux-armv7-upx`,
+  `dist/rcca-linux-armv8-upx`: the same four binaries packed with UPX, about a quarter of
+  the size and slower to start.
+- `dist/SHA256SUMS`: SHA-256 of all nine, verify with `cd dist && shasum -a 256 -c SHA256SUMS`.
+
+The macOS binary is not packed: UPX refuses Mach-O arm64 unless `--force-macos` is given,
+which upstream marks as unsupported. The unpacked Windows and Linux binaries are kept
+next to the packed ones, so both are shipped. `make dist` needs `brew install upx` and
+stops if the binary is missing; the level and flags are `UPX_FLAGS` (`-9 --lzma
+--no-progress` by default), e.g. `make dist UPX_FLAGS='-1'` for a faster pack.
 
 The three Linux binaries are fully static (no glibc, no OpenSSL shared library), so they
 run on any distribution. Cross toolchains needed on macOS:

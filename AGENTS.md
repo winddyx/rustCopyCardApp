@@ -11,7 +11,7 @@
   (`git push fork sy-wrapper:main`). Upstream nijaru/sy is never touched (no PRs, no
   issues, no feature requests).
 - Behaviour changes bump `Cargo.toml` and add `git tag -a vX.Y.Z`; tags so far are
-  `v2.1.0` … `v2.8.1`.
+  `v2.1.0` … `v2.9.0`.
 - License: MIT (`LICENSE`, Copyright (c) 2026 winddyx). `vendor/sy` keeps its own MIT
   license and copyright at `vendor/sy/LICENSE`; both notices must stay.
 
@@ -44,9 +44,15 @@
   `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-musl`,
   `armv7-unknown-linux-musleabihf`, `aarch64-unknown-linux-musl`. Artifacts are
   `dist/rcca-macos-arm64`, `dist/rcca-windows-x64.exe`, `dist/rcca-linux-x64`,
-  `dist/rcca-linux-armv7`, `dist/rcca-linux-armv8`, plus `SHA256SUMS`.
-- Cross compiling needs the rustup targets above, Homebrew `mingw-w64` for Windows, and
-  `zig` for the musl Linux targets. `scripts/zig-cc.sh` / `scripts/zig-ar.sh` wrap zig as
+  `dist/rcca-linux-armv7`, `dist/rcca-linux-armv8`, their UPX-packed twins
+  `dist/rcca-windows-x64-upx.exe`, `dist/rcca-linux-x64-upx`,
+  `dist/rcca-linux-armv7-upx`, `dist/rcca-linux-armv8-upx`, plus `SHA256SUMS`.
+  macOS stays unpacked (UPX rejects Mach-O arm64 without `--force-macos`); the packed
+  copies sit beside the originals rather than replacing them. UPX is required, its flags
+  are `UPX_FLAGS` (`-9 --lzma --no-progress`).
+- Cross compiling needs the rustup targets above, Homebrew `mingw-w64` for Windows,
+  `zig` for the musl Linux targets and Homebrew `upx` for the packed artifacts.
+  `scripts/zig-cc.sh` / `scripts/zig-ar.sh` wrap zig as
   the C compiler, `rust-lld` links, and OpenSSL is vendored for Linux via a
   target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
   armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
