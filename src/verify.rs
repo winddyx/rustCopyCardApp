@@ -1,9 +1,15 @@
 //! Verification pass: hash source and target for every file and compare the XXH64 digests.
+//!
+//! The loop honours the same `-j` as the copy: with `jobs > 1` several files are
+//! verified at once, which overlaps source reads with target reads. Results are
+//! collected per file and reported in manifest order, so the output does not depend
+//! on which worker finished first.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use xxhash_rust::xxh64::Xxh64;
 
@@ -30,6 +36,8 @@ pub struct Options {
     pub chunk: usize,
     pub keep_bad: bool,
     pub no_cache: bool,
+    /// Number of files verified at once, 1 means serial.
+    pub jobs: usize,
 }
 
 /// Compute the XXH64 of a file (seed = 0) without reporting progress.
@@ -84,6 +92,14 @@ fn disable_read_cache(file: &File) {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn disable_read_cache(_file: &File) {}
 
+/// What happened to one file, kept until the report is assembled in order.
+enum Outcome {
+    Matched,
+    Missing(String),
+    Mismatch(String),
+    Failed(String),
+}
+
 /// Verify the entries that were committed by the copy phase.
 pub fn run(
     files: &[Entry],
@@ -93,71 +109,105 @@ pub fn run(
     opts: &Options,
     stats: &Stats,
 ) -> VerifyReport {
-    let mut report = VerifyReport::default();
-    let mut buffer = vec![0u8; opts.chunk];
+    let jobs = opts.jobs.max(1).min(committed.len().max(1));
+    let outcomes: Mutex<Vec<Option<Outcome>>> =
+        Mutex::new((0..committed.len()).map(|_| None).collect());
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
 
-    for &index in committed {
-        let Some(entry) = files.get(index) else {
-            continue;
-        };
-        if stats.stop_requested() {
-            break;
-        }
-        let rel = entry.rel.display();
-        stats.set_current(entry.rel.file_name().to_string_lossy().into_owned());
-        let src = source.join(entry.rel.as_path());
-        let dst = target.join(entry.rel.as_path());
-
-        if !dst.exists() {
-            stats.verify_bad.fetch_add(1, Ordering::Relaxed);
-            report.missing.push(rel);
-            continue;
-        }
-
-        let src_hash = hash_counted(&src, &mut buffer, opts, stats);
-        let dst_hash = hash_counted(&dst, &mut buffer, opts, stats);
-
-        match (src_hash, dst_hash) {
-            (Ok(a), Ok(b)) if a == b => {
-                stats.verify_ok.fetch_add(1, Ordering::Relaxed);
-                report.matched += 1;
-            }
-            (Ok(a), Ok(b)) => {
-                stats.verify_bad.fetch_add(1, Ordering::Relaxed);
-                let mut message =
-                    format!("{rel}: hash mismatch (source {a:016X}, target {b:016X})");
-                if opts.keep_bad {
-                    let bad = target.join(bad_rel_path(entry.rel.as_path()));
-                    match fs::rename(&dst, &bad) {
-                        Ok(()) => message.push_str(", quarantined as .badhash"),
-                        Err(err) => {
-                            message.push_str(&format!(", quarantine failed: {err}"));
-                        }
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                // Each worker keeps its own read buffer.
+                let mut buffer = vec![0u8; opts.chunk];
+                loop {
+                    let pos = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(&index) = committed.get(pos) else {
+                        break;
+                    };
+                    if stats.stop_requested() {
+                        break;
                     }
-                } else {
-                    match fs::remove_file(&dst) {
-                        Ok(()) => message.push_str(", target file deleted"),
-                        Err(err) => message.push_str(&format!(", delete failed: {err}")),
+                    let Some(entry) = files.get(index) else {
+                        continue;
+                    };
+                    let outcome = verify_one(entry, source, target, opts, stats, &mut buffer);
+                    if let Ok(mut slots) = outcomes.lock() {
+                        slots[pos] = Some(outcome);
                     }
                 }
-                report.mismatched.push(message);
-            }
-            (Err(err), _) | (_, Err(err)) => {
-                stats.verify_bad.fetch_add(1, Ordering::Relaxed);
-                report.errors.push(format!("{rel}: read failed: {err}"));
-            }
+            });
         }
+    });
 
-        if let Some(issue) = crate::scan::check_stability(source, &files[index..index + 1])
-            .into_iter()
-            .next()
-            .flatten()
-        {
-            report.errors.push(format!("{rel}: {}", issue.describe()));
+    let mut report = VerifyReport::default();
+    for outcome in outcomes
+        .into_inner()
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+    {
+        match outcome {
+            Outcome::Matched => report.matched += 1,
+            Outcome::Missing(message) => report.missing.push(message),
+            Outcome::Mismatch(message) => report.mismatched.push(message),
+            Outcome::Failed(message) => report.errors.push(message),
         }
     }
-
     report
+}
+
+fn verify_one(
+    entry: &Entry,
+    source: &Path,
+    target: &Path,
+    opts: &Options,
+    stats: &Stats,
+    buffer: &mut [u8],
+) -> Outcome {
+    let rel = entry.rel.display();
+    stats.set_current(entry.rel.file_name().to_string_lossy().into_owned());
+    let src = source.join(entry.rel.as_path());
+    let dst = target.join(entry.rel.as_path());
+
+    if !dst.exists() {
+        return Outcome::Missing(rel);
+    }
+
+    let src_hash = hash_counted(&src, buffer, opts, stats);
+    let dst_hash = hash_counted(&dst, buffer, opts, stats);
+
+    let outcome = match (src_hash, dst_hash) {
+        (Ok(a), Ok(b)) if a == b => Outcome::Matched,
+        (Ok(a), Ok(b)) => {
+            let mut message = format!("{rel}: hash mismatch (source {a:016X}, target {b:016X})");
+            if opts.keep_bad {
+                let bad = target.join(bad_rel_path(entry.rel.as_path()));
+                match fs::rename(&dst, &bad) {
+                    Ok(()) => message.push_str(", quarantined as .badhash"),
+                    Err(err) => {
+                        message.push_str(&format!(", quarantine failed: {err}"));
+                    }
+                }
+            } else {
+                match fs::remove_file(&dst) {
+                    Ok(()) => message.push_str(", target file deleted"),
+                    Err(err) => message.push_str(&format!(", delete failed: {err}")),
+                }
+            }
+            Outcome::Mismatch(message)
+        }
+        (Err(err), _) | (_, Err(err)) => Outcome::Failed(format!("{rel}: read failed: {err}")),
+    };
+
+    if let Some(issue) = crate::scan::check_stability(source, std::slice::from_ref(entry))
+        .into_iter()
+        .next()
+        .flatten()
+    {
+        return Outcome::Failed(format!("{rel}: {}", issue.describe()));
+    }
+
+    outcome
 }
 
 /// Hash a file and add the bytes read to the stats the progress line reads.
@@ -171,6 +221,15 @@ fn hash_counted(path: &Path, buffer: &mut [u8], opts: &Options, stats: &Stats) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base_options() -> Options {
+        Options {
+            chunk: 4096,
+            keep_bad: false,
+            no_cache: false,
+            jobs: 1,
+        }
+    }
 
     #[test]
     fn empty_file_has_known_hash() {
@@ -209,11 +268,7 @@ mod tests {
             &[0],
             src.path(),
             dst.path(),
-            &Options {
-                chunk: 4096,
-                keep_bad: false,
-                no_cache: false,
-            },
+            &base_options(),
             &stats,
         );
         assert_eq!(report.matched, 0);
@@ -238,13 +293,112 @@ mod tests {
             src.path(),
             dst.path(),
             &Options {
-                chunk: 4096,
                 keep_bad: true,
-                no_cache: false,
+                ..base_options()
             },
             &stats,
         );
         assert_eq!(report.mismatched.len(), 1);
         assert!(dst.path().join(".f.bin.badhash").exists());
+    }
+
+    /// Build a source/target pair with `good` matching files and `bad` mismatching ones.
+    fn fixture(good: usize, bad: usize) -> (tempfile::TempDir, tempfile::TempDir, Vec<usize>) {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        for i in 0..good {
+            fs::write(src.path().join(format!("g{i:02}.bin")), b"same").unwrap();
+            fs::write(dst.path().join(format!("g{i:02}.bin")), b"same").unwrap();
+        }
+        for i in 0..bad {
+            fs::write(src.path().join(format!("b{i:02}.bin")), b"left").unwrap();
+            fs::write(dst.path().join(format!("b{i:02}.bin")), b"right").unwrap();
+        }
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let indices = (0..manifest.files.len()).collect();
+        (src, dst, indices)
+    }
+
+    #[test]
+    fn parallel_verification_matches_the_serial_result() {
+        let (src, dst, indices) = fixture(12, 3);
+
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let serial = run(
+            &manifest.files,
+            &indices,
+            src.path(),
+            dst.path(),
+            &base_options(),
+            &Stats::new(),
+        );
+
+        // Rebuild the target so the mismatching files exist again for the parallel run.
+        let (src2, dst2, indices2) = fixture(12, 3);
+        let manifest2 = crate::scan::scan(src2.path(), dst2.path()).unwrap();
+        let parallel = run(
+            &manifest2.files,
+            &indices2,
+            src2.path(),
+            dst2.path(),
+            &Options {
+                jobs: 4,
+                ..base_options()
+            },
+            &Stats::new(),
+        );
+
+        assert_eq!(serial.matched, parallel.matched);
+        assert_eq!(serial.mismatched.len(), parallel.mismatched.len());
+        assert_eq!(serial.missing.len(), parallel.missing.len());
+        assert_eq!(serial.errors.len(), parallel.errors.len());
+        assert_eq!(parallel.matched, 12);
+        assert_eq!(parallel.mismatched.len(), 3);
+    }
+
+    #[test]
+    fn mismatches_are_reported_in_manifest_order() {
+        let (src, dst, indices) = fixture(4, 6);
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let report = run(
+            &manifest.files,
+            &indices,
+            src.path(),
+            dst.path(),
+            &Options {
+                jobs: 8,
+                ..base_options()
+            },
+            &Stats::new(),
+        );
+        let names: Vec<&str> = report
+            .mismatched
+            .iter()
+            .map(|m| m.split(':').next().unwrap())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "output order must not depend on worker order"
+        );
+    }
+
+    #[test]
+    fn jobs_greater_than_file_count_is_fine() {
+        let (src, dst, indices) = fixture(3, 0);
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let report = run(
+            &manifest.files,
+            &indices,
+            src.path(),
+            dst.path(),
+            &Options {
+                jobs: 16,
+                ..base_options()
+            },
+            &Stats::new(),
+        );
+        assert_eq!(report.matched, 3);
     }
 }

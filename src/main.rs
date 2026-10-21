@@ -220,6 +220,7 @@ fn run(cli: Cli) -> Result<i32> {
         chunk: VERIFY_CHUNK,
         keep_bad: cli.keep_bad,
         no_cache: cli.verify_no_cache,
+        jobs: cli.jobs,
     };
     view.set_phase(Phase::Verify);
     let verify_report = verify::run(

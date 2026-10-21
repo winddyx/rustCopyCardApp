@@ -43,7 +43,7 @@
 
 - `make dist`: wipe `dist/`, build `aarch64-apple-darwin` and `x86_64-pc-windows-gnu`,
   produce `dist/rcca-macos-arm64`, `dist/rcca-windows-x64.exe` and `dist/SHA256SUMS`.
-- `make test` (that is `cargo test`): 42 unit tests plus 20 integration tests.
+- `make test` (that is `cargo test`): 46 unit tests plus 20 integration tests.
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
 - Cross compiling for Windows needs `rustup target add x86_64-pc-windows-gnu` and
   Homebrew's `mingw-w64`.
@@ -71,8 +71,10 @@
   with `--quiet` nothing is drawn, no thread starts and stderr stays empty.
 - Every sy progress output stays off (`quiet=true`, `progress=false`); the file name and
   byte counts come from the two callbacks in `vendor/sy`.
-- The copy is serial by default (`-j 1`, `max_concurrent`). Do not raise it without a
-  reason: with parallel transfers the "current file" jumps between files.
+- Both phases are serial by default (`-j 1`; the copy maps it to sy's `max_concurrent`).
+  Verification spreads files over `jobs` worker threads with its own buffer each and
+  collects outcomes per file, so the report order never depends on worker order. Do not
+  raise the default without a reason: with `-j > 1` the "current file" jumps.
 - The label is dim, everything else default colour; `--color auto|always|never`, and
   `NO_COLOR` or `TERM=dumb` disables colour.
 

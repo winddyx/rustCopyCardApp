@@ -44,8 +44,10 @@ with code 1 and the target stays untouched.
 
 ## Options
 
-- `-j, --jobs <N>`: parallel file transfers handed to sy (its `-j`), default 1
-  (serial). Raise it only if you do not need a stable "current file".
+- `-j, --jobs <N>`: files handled at once, in both phases; default 1 (serial). The copy
+  passes it straight to sy's `-j`; verification runs that many files in parallel, which
+  overlaps source reads with target reads. Results are still reported in manifest order.
+  With `-j > 1` the progress line shows whichever in-flight file was touched last.
 - `--keep-source-name`: keep the source directory name in the target layout.
 - `--skip-unreadable`: skip unreadable source files instead of failing the preflight.
 - `--force`: continue even when the target looks too small.
@@ -103,8 +105,8 @@ is given, nothing is drawn and no thread is started: stderr stays empty.
 
 sy's own planning messages, overall bar and per-file bars are all off; the file name and
 byte counts arrive through two callbacks added in `vendor/sy` (see
-`vendor/sy/PATCHES.md`). The copy is serial by default (`-j 1`), so the line always shows
-the one file being worked on.
+`vendor/sy/PATCHES.md`). Both phases are serial by default (`-j 1`), so the line always
+shows the one file being worked on.
 
 ## Exit codes
 
@@ -132,7 +134,7 @@ the one file being worked on.
 ## Tests
 
 ```bash
-cargo test                                        # 62 tests (42 unit + 20 integration)
+cargo test                                        # 66 tests (46 unit + 20 integration)
 cargo clippy --all-targets -- -D warnings
 ```
 

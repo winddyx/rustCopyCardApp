@@ -37,8 +37,6 @@ pub struct Stats {
     /// Bytes read during verification. Both sides are read, so this is twice the file size.
     pub hashed_bytes: AtomicU64,
     pub files_skipped: AtomicUsize,
-    pub verify_ok: AtomicUsize,
-    pub verify_bad: AtomicUsize,
     pub cancel: AtomicBool,
     pub abort: AtomicBool,
     abort_reason: Mutex<Option<String>>,
@@ -58,8 +56,6 @@ impl Stats {
             copied_bytes: AtomicU64::new(0),
             hashed_bytes: AtomicU64::new(0),
             files_skipped: AtomicUsize::new(0),
-            verify_ok: AtomicUsize::new(0),
-            verify_bad: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
             abort: AtomicBool::new(false),
             abort_reason: Mutex::new(None),
