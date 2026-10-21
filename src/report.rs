@@ -41,12 +41,9 @@ pub fn render(summary: &Summary) -> Vec<String> {
     lines.push(format!("source: {}", summary.source.display()));
     lines.push(format!("target: {}", summary.target.display()));
     lines.push(format!(
-        "files {}, {} total",
+        "files {}, {} total, elapsed {}",
         summary.files_total,
-        human_bytes(summary.bytes_total)
-    ));
-    lines.push(format!(
-        "elapsed {}",
+        human_bytes(summary.bytes_total),
         human_duration(summary.elapsed.as_secs())
     ));
 
@@ -138,6 +135,20 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("copy (sy, includes directories): 2 created")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn file_count_and_elapsed_share_one_line() {
+        let lines = render(&base());
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("files "))
+            .expect("a files line");
+        assert_eq!(line, "files 2, 2.0 KiB total, elapsed 00:03");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("elapsed ")),
+            "elapsed must not get a line of its own: {lines:?}"
         );
     }
 

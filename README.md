@@ -86,6 +86,17 @@ VERIFY  100%   11.0/11.0 GiB  C7418.MP4
 - The label is dim, everything else uses the default colour. `--color auto|always|never`,
   default `auto` (checks `NO_COLOR`, `TERM=dumb` and whether stderr is a TTY).
 
+The summary on stdout looks like this:
+
+```
+source: /Volumes/CARD
+target: /Users/me/footage/2024-05-01
+files 1351, 40.3 GiB total, elapsed 07:12
+copy (sy, includes directories): 1351 created, 0 updated, 0 skipped, 0 deleted, 40.3 GiB transferred
+verify (XXH64): 1351 passed, 0 failed
+result: all files copied and verified with XXH64
+```
+
 Progress goes to stderr and stdout carries only the summary, so
 `rcca source target > log.txt` yields clean text. When stderr is not a TTY or `--quiet`
 is given, nothing is drawn and no thread is started: stderr stays empty.
