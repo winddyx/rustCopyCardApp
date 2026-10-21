@@ -4,12 +4,11 @@
 
 - Package `rustcopycardapp`; library and binary are both `rcca` (`[lib]` / `[[bin]]` in
   `Cargo.toml`).
-- Working branch `sy-wrapper` (copies go through the embedded sy). Local `main` is frozen
-  at `v1.0.2`, the hand-written engine, kept for reference only.
+- Working branch `main` (copies go through the embedded sy). The hand-written engine is
+  kept for reference only, reachable through the tag `v1.0.2`.
 - Remote `fork` is `git@github.com:winddyx/rustCopyCardApp.git`, the user's own public
-  repository; its `main` holds the `sy-wrapper` line of work
-  (`git push fork sy-wrapper:main`). Upstream nijaru/sy is never touched (no PRs, no
-  issues, no feature requests).
+  repository; its `main` carries this line of work (`git push fork main`). Upstream
+  nijaru/sy is never touched (no PRs, no issues, no feature requests).
 - Behaviour changes bump `Cargo.toml` and add `git tag -a vX.Y.Z`; tags so far are
   `v2.1.0` … `v2.9.0`.
 - License: MIT (`LICENSE`, Copyright (c) 2026 winddyx). `vendor/sy` keeps its own MIT
