@@ -128,6 +128,53 @@ fn copies_tree_and_verifies() {
 }
 
 #[test]
+fn transfer_counts_files_not_directories() {
+    // sy counts directory entries in its own "created" figure, rcca counts transferred
+    // files only, so the two rows differ by the two directories here.
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "a/b/one.bin", b"1");
+    write_file(src.path(), "a/two.bin", b"22");
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.status.success(), "output: {stdout}");
+    assert!(
+        stdout.contains("  Copy       4 created"),
+        "two directories and two files, as sy counts them: {stdout}"
+    );
+    assert!(
+        stdout.contains("  Transfer   2 files · 3 B"),
+        "only the two files are transfers: {stdout}"
+    );
+}
+
+#[test]
+fn a_failed_copy_is_not_counted_as_transferred() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        write_file(src.path(), "sub/locked.bin", b"blocked");
+        write_file(src.path(), "ok.bin", b"fine");
+        let locked = dst.path().join("sub");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert_eq!(output.status.code(), Some(1), "output: {stdout}");
+        assert!(
+            stdout.contains("  Transfer   1 file · 4 B"),
+            "the blocked file must not count as transferred: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn overwrites_existing_file() {
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();

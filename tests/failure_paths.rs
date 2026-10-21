@@ -95,6 +95,67 @@ fn skip_unreadable_copies_the_rest() {
     assert!(dst.path().join("ok.bin").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn the_problem_count_matches_the_listed_problems() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // One copy error plus the resulting missing target file: two problems, listed twice.
+    // A copy error used to be counted a second time through its own counter.
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "sub/a.bin", b"payload");
+    let locked = dst.path().join("sub");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(output.status.code(), Some(1), "output: {stdout}");
+    assert!(
+        stdout.contains("! Failed: 2 problems"),
+        "one copy error and one missing target is two problems: {stdout}"
+    );
+    let listed = stdout.lines().filter(|l| l.starts_with("    - ")).count();
+    assert_eq!(listed, 2, "the count and the list must agree: {stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapped_copy_errors_stay_on_one_line() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "sub/a.bin", b"payload");
+    let locked = dst.path().join("sub");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // sy wraps its errors over several lines; each bullet must stay one line so the
+    // list keeps its indentation.
+    for line in stdout.lines() {
+        assert!(
+            !line.starts_with("Cause:") && !line.starts_with("Check disk space"),
+            "an unterminated detail line leaked into the summary: {stdout}"
+        );
+    }
+    let bullet = stdout
+        .lines()
+        .find(|l| l.starts_with("    - copying "))
+        .expect("copy error listed");
+    assert!(
+        bullet.contains("Cause:") && bullet.contains("Permission denied"),
+        "the whole message stays on the bullet: {bullet}"
+    );
+}
+
 #[test]
 fn deletion_threshold_aborts_mirror() {
     // Most target files are absent from the source: sy's default --max-delete 50%

@@ -30,12 +30,6 @@ pub struct Manifest {
     pub conflicts: Vec<String>,
 }
 
-impl Manifest {
-    pub fn file_count(&self) -> usize {
-        self.files.len()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceIssue {
     Vanished,
@@ -241,7 +235,7 @@ mod tests {
         fs::create_dir_all(src.path().join("empty")).unwrap();
 
         let manifest = scan(src.path(), dst.path()).unwrap();
-        assert_eq!(manifest.file_count(), 2);
+        assert_eq!(manifest.files.len(), 2);
         assert_eq!(manifest.total_bytes, 6);
         assert!(manifest.errors.is_empty());
         let rels: Vec<String> = manifest.files.iter().map(|f| f.rel.display()).collect();
@@ -256,7 +250,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("real.txt", src.path().join("link.txt")).unwrap();
         let manifest = scan(src.path(), dst.path()).unwrap();
-        assert_eq!(manifest.file_count(), 1);
+        assert_eq!(manifest.files.len(), 1);
         #[cfg(unix)]
         assert_eq!(manifest.skipped_symlinks, 1);
     }

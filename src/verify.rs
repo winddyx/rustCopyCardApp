@@ -20,17 +20,11 @@ use crate::stats::Stats;
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     pub matched: usize,
-    /// Bytes held by the files that passed.
-    pub matched_bytes: u64,
+    /// Bytes of every file that was checked, whatever the outcome.
+    pub checked_bytes: u64,
     pub mismatched: Vec<String>,
     pub missing: Vec<String>,
     pub errors: Vec<String>,
-}
-
-impl VerifyReport {
-    pub fn failed(&self) -> bool {
-        !self.mismatched.is_empty() || !self.missing.is_empty() || !self.errors.is_empty()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +54,7 @@ pub fn hash_stream(
         disable_read_cache(&file);
     }
     let mut hasher = Xxh64::new(0);
-    let mut reader = io::BufReader::with_capacity(buffer.len(), file);
+    let mut reader = file;
     loop {
         let n = match reader.read(buffer) {
             Ok(0) => break,
@@ -96,24 +90,23 @@ fn disable_read_cache(_file: &File) {}
 
 /// What happened to one file, kept until the report is assembled in order.
 enum Outcome {
-    Matched(u64),
+    Matched,
     Missing(String),
     Mismatch(String),
     Failed(String),
 }
 
-/// Verify the entries that were committed by the copy phase.
+/// Verify every manifest entry against the target, in parallel when `jobs > 1`.
 pub fn run(
     files: &[Entry],
-    committed: &[usize],
     source: &Path,
     target: &Path,
     opts: &Options,
     stats: &Stats,
 ) -> VerifyReport {
-    let jobs = opts.jobs.max(1).min(committed.len().max(1));
+    let jobs = opts.jobs.max(1).min(files.len().max(1));
     let outcomes: Mutex<Vec<Option<Outcome>>> =
-        Mutex::new((0..committed.len()).map(|_| None).collect());
+        Mutex::new((0..files.len()).map(|_| None).collect());
     let cursor = std::sync::atomic::AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
@@ -123,15 +116,12 @@ pub fn run(
                 let mut buffer = vec![0u8; opts.chunk];
                 loop {
                     let pos = cursor.fetch_add(1, Ordering::Relaxed);
-                    let Some(&index) = committed.get(pos) else {
+                    let Some(entry) = files.get(pos) else {
                         break;
                     };
                     if stats.stop_requested() {
                         break;
                     }
-                    let Some(entry) = files.get(index) else {
-                        continue;
-                    };
                     let outcome = verify_one(entry, source, target, opts, stats, &mut buffer);
                     if let Ok(mut slots) = outcomes.lock() {
                         slots[pos] = Some(outcome);
@@ -142,17 +132,17 @@ pub fn run(
     });
 
     let mut report = VerifyReport::default();
-    for outcome in outcomes
-        .into_inner()
-        .unwrap_or_default()
-        .into_iter()
-        .flatten()
-    {
+    let collected = outcomes.into_inner().unwrap_or_default();
+    for (pos, outcome) in collected.into_iter().enumerate() {
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        // Files that were never reached (interrupted run) do not count as checked.
+        if let Some(entry) = files.get(pos) {
+            report.checked_bytes += entry.size;
+        }
         match outcome {
-            Outcome::Matched(size) => {
-                report.matched += 1;
-                report.matched_bytes += size;
-            }
+            Outcome::Matched => report.matched += 1,
             Outcome::Missing(message) => report.missing.push(message),
             Outcome::Mismatch(message) => report.mismatched.push(message),
             Outcome::Failed(message) => report.errors.push(message),
@@ -174,15 +164,27 @@ fn verify_one(
     let src = source.join(entry.rel.as_path());
     let dst = target.join(entry.rel.as_path());
 
-    if !dst.exists() {
-        return Outcome::Missing(rel);
+    // A target that cannot be inspected is an error, not an absent file.
+    match fs::metadata(&dst) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Outcome::Missing(rel),
+        Err(err) => return Outcome::Failed(format!("{rel}: cannot inspect target: {err}")),
+    }
+
+    // A source that already moved on since the scan cannot be compared meaningfully, and
+    // acting on its hash could delete the only good copy.
+    if let Some(issue) = stability_issue(source, entry) {
+        return Outcome::Failed(format!("{rel}: {}", issue.describe()));
     }
 
     let src_hash = hash_counted(&src, buffer, opts, stats);
+    if let Some(issue) = stability_issue(source, entry) {
+        return Outcome::Failed(format!("{rel}: {}", issue.describe()));
+    }
     let dst_hash = hash_counted(&dst, buffer, opts, stats);
 
     let outcome = match (src_hash, dst_hash) {
-        (Ok(a), Ok(b)) if a == b => Outcome::Matched(entry.size),
+        (Ok(a), Ok(b)) if a == b => Outcome::Matched,
         (Ok(a), Ok(b)) => {
             let mut message = format!("{rel}: hash mismatch (source {a:016X}, target {b:016X})");
             if opts.keep_bad {
@@ -204,15 +206,15 @@ fn verify_one(
         (Err(err), _) | (_, Err(err)) => Outcome::Failed(format!("{rel}: read failed: {err}")),
     };
 
-    if let Some(issue) = crate::scan::check_stability(source, std::slice::from_ref(entry))
+    outcome
+}
+
+/// Compare one entry against the manifest recorded before the copy.
+fn stability_issue(source: &Path, entry: &Entry) -> Option<crate::scan::SourceIssue> {
+    crate::scan::check_stability(source, std::slice::from_ref(entry))
         .into_iter()
         .next()
         .flatten()
-    {
-        return Outcome::Failed(format!("{rel}: {}", issue.describe()));
-    }
-
-    outcome
 }
 
 /// Hash a file and add the bytes read to the stats the progress line reads.
@@ -270,7 +272,6 @@ mod tests {
         let stats = Stats::new();
         let report = run(
             &manifest.files,
-            &[0],
             src.path(),
             dst.path(),
             &base_options(),
@@ -294,7 +295,6 @@ mod tests {
         let stats = Stats::new();
         let report = run(
             &manifest.files,
-            &[0],
             src.path(),
             dst.path(),
             &Options {
@@ -308,7 +308,7 @@ mod tests {
     }
 
     /// Build a source/target pair with `good` matching files and `bad` mismatching ones.
-    fn fixture(good: usize, bad: usize) -> (tempfile::TempDir, tempfile::TempDir, Vec<usize>) {
+    fn fixture(good: usize, bad: usize) -> (tempfile::TempDir, tempfile::TempDir) {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         for i in 0..good {
@@ -319,19 +319,16 @@ mod tests {
             fs::write(src.path().join(format!("b{i:02}.bin")), b"left").unwrap();
             fs::write(dst.path().join(format!("b{i:02}.bin")), b"right").unwrap();
         }
-        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
-        let indices = (0..manifest.files.len()).collect();
-        (src, dst, indices)
+        (src, dst)
     }
 
     #[test]
     fn parallel_verification_matches_the_serial_result() {
-        let (src, dst, indices) = fixture(12, 3);
+        let (src, dst) = fixture(12, 3);
 
         let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
         let serial = run(
             &manifest.files,
-            &indices,
             src.path(),
             dst.path(),
             &base_options(),
@@ -339,11 +336,10 @@ mod tests {
         );
 
         // Rebuild the target so the mismatching files exist again for the parallel run.
-        let (src2, dst2, indices2) = fixture(12, 3);
+        let (src2, dst2) = fixture(12, 3);
         let manifest2 = crate::scan::scan(src2.path(), dst2.path()).unwrap();
         let parallel = run(
             &manifest2.files,
-            &indices2,
             src2.path(),
             dst2.path(),
             &Options {
@@ -363,11 +359,10 @@ mod tests {
 
     #[test]
     fn mismatches_are_reported_in_manifest_order() {
-        let (src, dst, indices) = fixture(4, 6);
+        let (src, dst) = fixture(4, 6);
         let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
         let report = run(
             &manifest.files,
-            &indices,
             src.path(),
             dst.path(),
             &Options {
@@ -390,12 +385,47 @@ mod tests {
     }
 
     #[test]
-    fn jobs_greater_than_file_count_is_fine() {
-        let (src, dst, indices) = fixture(3, 0);
+    fn checked_bytes_cover_every_file_that_was_looked_at() {
+        let (src, dst) = fixture(3, 1);
         let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
         let report = run(
             &manifest.files,
-            &indices,
+            src.path(),
+            dst.path(),
+            &base_options(),
+            &Stats::new(),
+        );
+        assert_eq!(report.matched, 3);
+        assert_eq!(report.mismatched.len(), 1);
+        // Four files of four bytes each: the failing one is checked too.
+        assert_eq!(report.checked_bytes, 16);
+    }
+
+    #[test]
+    fn an_uninspectable_target_is_an_error_not_a_missing_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.bin"), b"abc").unwrap();
+        // A directory where the file should be: metadata succeeds, reading it does not.
+        fs::create_dir(dst.path().join("f.bin")).unwrap();
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let report = run(
+            &manifest.files,
+            src.path(),
+            dst.path(),
+            &base_options(),
+            &Stats::new(),
+        );
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn jobs_greater_than_file_count_is_fine() {
+        let (src, dst) = fixture(3, 0);
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let report = run(
+            &manifest.files,
             src.path(),
             dst.path(),
             &Options {

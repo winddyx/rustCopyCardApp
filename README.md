@@ -66,7 +66,7 @@ with code 1 and the target stays untouched.
 - `--force`: continue even when the target looks too small.
 - `--fail-fast`: abort on the first failure (mapped to sy's `max_errors = 1`).
 - `--quiet`: draw nothing, print the summary only.
-- `--verbose`: print the complete failure list.
+- `--verbose`: keep and print the complete failure list instead of the first 20.
 - `--keep-bad`: quarantine mismatching target files as `.<name>.badhash` instead of
   deleting them.
 - `--verify-no-cache`: bypass the page cache while hashing (macOS `F_NOCACHE`, Linux
@@ -116,10 +116,16 @@ DST  /Volumes/MOD/200 个人目录/David/1020 01
 ```
 
 `Files` is the manifest (elapsed time at the end), `Copy` is sy's own accounting (it
-includes directory entries), `Transfer` counts regular files sy actually moved, and
-`Verify` reports the files checked, the bytes they hold and how many passed. On failure
-the last line becomes `! Failed: N problems, listed below` and an indented list follows;
-on Ctrl-C it becomes `! Interrupted: …`.
+includes directory entries), `Transfer` counts regular files sy actually moved (finished transfers only), and
+`Verify` reports the files checked, their total size and how many passed. On failure the
+last line becomes `! Failed: N problems, listed below` with an indented list of up to 20
+examples; the number is the real total, so `--verbose` is the way to see them all. On
+Ctrl-C it becomes `! Interrupted: …` and the exit code is 130.
+
+Symlinks and special files in the source are handled separately: sy copies symlinks but
+rcca cannot hash them, and fifos, sockets and devices are not copied at all. Both cases
+print a one-line note on stderr (suppressed by `--quiet`) instead of disappearing from
+the counts.
 
 Progress goes to stderr and stdout carries only the summary, so
 `rcca source target > log.txt` yields clean text. When stderr is not a TTY or `--quiet`

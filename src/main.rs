@@ -36,7 +36,11 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     let started = Instant::now();
-    let stats = Arc::new(Stats::new());
+    let stats = Arc::new(if cli.verbose {
+        Stats::verbose()
+    } else {
+        Stats::new()
+    });
     let style = ui::Style {
         color: ui::color_enabled(cli.color),
     };
@@ -107,13 +111,34 @@ fn run(cli: Cli) -> Result<i32> {
         )));
     }
 
+    // sy copies symlinks but rcca cannot hash them, and special files are skipped, so
+    // both are called out instead of vanishing from the counts.
+    if !cli.quiet && manifest.skipped_symlinks > 0 {
+        let (noun, verb) = if manifest.skipped_symlinks == 1 {
+            ("symlink is", "was")
+        } else {
+            ("symlinks are", "were")
+        };
+        eprintln!(
+            "rcca: {} {noun} copied but not verified ({verb} not checked)",
+            manifest.skipped_symlinks
+        );
+    }
+    if !cli.quiet && manifest.skipped_special > 0 {
+        let noun = if manifest.skipped_special == 1 {
+            "special file (fifo, socket, device) is"
+        } else {
+            "special files (fifos, sockets, devices) are"
+        };
+        eprintln!("rcca: {} {noun} not copied", manifest.skipped_special);
+    }
+
     let unreadable = scan::probe_readable(&source, &manifest.files);
     if !unreadable.is_empty() {
         if cli.skip_unreadable {
-            let bad: Vec<String> = unreadable.iter().map(|(rel, _)| rel.display()).collect();
-            manifest
-                .files
-                .retain(|entry| !bad.contains(&entry.rel.display()));
+            let bad: std::collections::HashSet<&paths::RelPath> =
+                unreadable.iter().map(|(rel, _)| rel).collect();
+            manifest.files.retain(|entry| !bad.contains(&entry.rel));
             manifest.total_bytes = manifest.files.iter().map(|e| e.size).sum();
             for (rel, err) in &unreadable {
                 stats.files_skipped.fetch_add(1, Ordering::Relaxed);
@@ -167,10 +192,10 @@ fn run(cli: Cli) -> Result<i32> {
             deleted: 0,
             transferred_files: 0,
             bytes_transferred: 0,
-            copy_errors: 0,
             verified: 0,
             verify_failed: 0,
-            verified_bytes: 0,
+            checked_bytes: 0,
+            failure_count: 0,
             failures: Vec::new(),
             verbose: cli.verbose,
             interrupted: false,
@@ -194,14 +219,18 @@ fn run(cli: Cli) -> Result<i32> {
         engine::set_file_observer(move |path| {
             if let Some(name) = path.file_name() {
                 stats_for_name.set_current(name.to_string_lossy().into_owned());
-                stats_for_name.copied_files.fetch_add(1, Ordering::Relaxed);
             }
         });
         let stats_for_bytes = Arc::clone(&stats);
-        engine::set_bytes_observer(move |bytes| {
+        engine::set_bytes_observer(move |bytes, transferred_file| {
             stats_for_bytes
                 .copied_bytes
                 .fetch_add(bytes, Ordering::Relaxed);
+            // Only finished transfers of regular files count, so a failed copy does not
+            // show up as a transferred file.
+            if transferred_file {
+                stats_for_bytes.copied_files.fetch_add(1, Ordering::Relaxed);
+            }
         });
     }
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
@@ -218,7 +247,6 @@ fn run(cli: Cli) -> Result<i32> {
     // Ctrl-C is not intercepted during the copy (sy ends on its own); from here rcca owns it.
     install_signal_handler(&stats);
 
-    let indices: Vec<usize> = (0..manifest.files.len()).collect();
     let verify_opts = verify::Options {
         chunk: VERIFY_CHUNK,
         keep_bad: cli.keep_bad,
@@ -226,14 +254,7 @@ fn run(cli: Cli) -> Result<i32> {
         jobs: cli.jobs,
     };
     view.set_phase(Phase::Verify);
-    let verify_report = verify::run(
-        &manifest.files,
-        &indices,
-        &source,
-        &target_root,
-        &verify_opts,
-        &stats,
-    );
+    let verify_report = verify::run(&manifest.files, &source, &target_root, &verify_opts, &stats);
     live.finish();
 
     let interrupted = stats.cancel.load(Ordering::SeqCst);
@@ -242,7 +263,9 @@ fn run(cli: Cli) -> Result<i32> {
     }
 
     // ---------- summary ----------
+    // The example list is bounded, the count is not: report the count, list the examples.
     let mut failures = stats.failure_examples();
+    let mut failure_count = stats.failure_count();
     failures.extend(verify_report.mismatched.clone());
     failures.extend(
         verify_report
@@ -251,8 +274,10 @@ fn run(cli: Cli) -> Result<i32> {
             .map(|p| format!("{p}: target file missing")),
     );
     failures.extend(verify_report.errors.clone());
+    failure_count += verify_failed(&verify_report);
     if let Some(reason) = stats.abort_reason() {
         failures.push(format!("aborted on request: {reason}"));
+        failure_count += 1;
     }
 
     let summary = Summary {
@@ -267,12 +292,10 @@ fn run(cli: Cli) -> Result<i32> {
         deleted: copy.files_deleted,
         transferred_files: stats.copied_files.load(Ordering::Relaxed),
         bytes_transferred: copy.bytes_transferred,
-        copy_errors: copy.errors.len(),
         verified: verify_report.matched,
-        verify_failed: verify_report.mismatched.len()
-            + verify_report.missing.len()
-            + verify_report.errors.len(),
-        verified_bytes: verify_report.matched_bytes,
+        verify_failed: verify_failed(&verify_report),
+        checked_bytes: verify_report.checked_bytes,
+        failure_count,
         failures,
         verbose: cli.verbose,
         interrupted,
@@ -282,11 +305,16 @@ fn run(cli: Cli) -> Result<i32> {
     if interrupted {
         return Ok(130);
     }
-    if summary.failures.is_empty() {
+    if summary.failure_count == 0 {
         Ok(0)
     } else {
         Ok(1)
     }
+}
+
+/// Files that did not pass verification.
+fn verify_failed(report: &verify::VerifyReport) -> usize {
+    report.mismatched.len() + report.missing.len() + report.errors.len()
 }
 
 fn install_signal_handler(stats: &Arc<Stats>) {
@@ -350,16 +378,18 @@ fn fs_type_name(path: &Path) -> Option<String> {
 fn fs_type_name(path: &Path) -> Option<String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
+    // Same names the macOS branch returns, so is_fat_family sees one vocabulary.
+    const MSDOS_SUPER_MAGIC: i64 = 0x4d44; // FAT12/16/32
+    const EXFAT_SUPER_MAGIC: i64 = 0x2011_bab0;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut buf) } != 0 {
         return None;
     }
-    if buf.f_type as i64 == MSDOS_SUPER_MAGIC {
-        Some("msdos".to_string())
-    } else {
-        Some(format!("magic:{:#x}", buf.f_type))
+    match buf.f_type as i64 {
+        MSDOS_SUPER_MAGIC => Some("msdos".to_string()),
+        EXFAT_SUPER_MAGIC => Some("exfat".to_string()),
+        other => Some(format!("magic:{other:#x}")),
     }
 }
 

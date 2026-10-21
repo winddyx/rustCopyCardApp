@@ -75,6 +75,12 @@
   column 8, over-long names are truncated from the start so the extension survives.
 - stdout carries the summary only, so `rcca source target > log` is clean text. Without a
   TTY on stderr or with `--quiet`, nothing is drawn, no thread starts, stderr is empty.
+- The failure count in the result line comes from `Stats::failure_count()`, not from the
+  length of the example list: the store is bounded (32 examples, 64 KiB), the count is
+  not. `--verbose` raises both bounds so its list is complete. Failure text is flattened
+  to one line before printing, sy wraps its errors.
+- Symlinks and special files are counted in `Manifest::skipped_symlinks` /
+  `skipped_special` and reported as a stderr note, never silently dropped.
 - `-j/--jobs` (default 1) applies to both phases: sy's `max_concurrent` for the copy, a
   `std::thread::scope` pool with one buffer per worker for verification. Verification
   collects one outcome per file and reports in manifest order, so results never depend on

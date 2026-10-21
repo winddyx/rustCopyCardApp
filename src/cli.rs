@@ -51,7 +51,7 @@ pub struct Cli {
     #[arg(long, conflicts_with = "verbose")]
     pub quiet: bool,
 
-    /// Print per-file detail and the complete failure list
+    /// Keep and print the complete failure list instead of the first few
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,
 

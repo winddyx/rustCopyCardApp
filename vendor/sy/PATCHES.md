@@ -26,10 +26,14 @@ The remaining change is about copy progress, not compilation:
 
 4. `src/sync/progress.rs` gains two observers: `set_file_observer` /
    `notify_file_started` for "a file started copying", and `set_bytes_observer` /
-   `notify_bytes_accounted` for byte counts. `copy_file` in `src/sync/transfer.rs`
-   fires the first, and so does `update()` because updates go through
-   `sync_file_with_delta` and never reach `copy_file`; `src/sync/mod.rs` reports the size
-   of every finished task (create, update and skip all count).
+   `notify_bytes_accounted(bytes, transferred_file)` for finished tasks.
+   `copy_file` in `src/sync/transfer.rs` fires the first, and so does `update()` because
+   updates go through `sync_file_with_delta` and never reach `copy_file`.
+   `src/sync/mod.rs` computes both figures from the finished task: the size of every
+   completed create, update or skip, plus a flag that is true only when the task moved
+   one regular file. A failed task reports `(0, false)`, so neither the progress figure
+   nor the transfer count claims work that did not happen, and directories never count
+   as transferred files.
    Upstream has no per-file callback at all, so a host can only guess progress from the
    bars. With these two callbacks rcca turns off every sy progress output
    (`quiet=true`, `progress=false`) and draws one line with phase, percentage, bytes and

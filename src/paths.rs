@@ -47,10 +47,6 @@ impl RelPath {
         &self.0
     }
 
-    pub fn into_path_buf(self) -> PathBuf {
-        self.0
-    }
-
     /// Used for logs and display; the file name may not be UTF-8, so this is lossy.
     pub fn display(&self) -> String {
         self.0.to_string_lossy().into_owned()
@@ -58,10 +54,6 @@ impl RelPath {
 
     pub fn file_name(&self) -> &std::ffi::OsStr {
         self.0.file_name().unwrap_or_default()
-    }
-
-    pub fn join_target(&self, root: &Path) -> PathBuf {
-        root.join(&self.0)
     }
 }
 

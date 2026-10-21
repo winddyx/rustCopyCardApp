@@ -48,11 +48,11 @@ where
     sy::sync::progress::set_file_observer(Box::new(observer));
 }
 
-/// Register a callback fired with the byte count of every finished task, used for
-/// the overall progress figure.
+/// Register a callback fired for every finished task: the bytes it accounted for and
+/// whether it transferred one regular file.
 pub fn set_bytes_observer<F>(observer: F)
 where
-    F: Fn(u64) + Send + Sync + 'static,
+    F: Fn(u64, bool) + Send + Sync + 'static,
 {
     sy::sync::progress::set_bytes_observer(Box::new(observer));
 }

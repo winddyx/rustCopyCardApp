@@ -36,7 +36,8 @@ pub fn notify_file_started(path: &Path) {
 }
 
 /// rcca patch: observer for bytes handled per finished task, used for overall progress.
-pub type BytesObserver = dyn Fn(u64) + Send + Sync;
+/// The flag is true when the finished task moved one regular file (create or update).
+pub type BytesObserver = dyn Fn(u64, bool) + Send + Sync;
 
 static BYTES_OBSERVER: std::sync::OnceLock<Box<BytesObserver>> = std::sync::OnceLock::new();
 
@@ -45,13 +46,14 @@ pub fn set_bytes_observer(observer: Box<BytesObserver>) {
     let _ = BYTES_OBSERVER.set(observer);
 }
 
-/// Report the bytes of a finished task (create, update and skip all count).
-pub fn notify_bytes_accounted(bytes: u64) {
-    if bytes == 0 {
+/// Report the bytes of a finished task (create, update and skip all count) and whether
+/// it moved a regular file.
+pub fn notify_bytes_accounted(bytes: u64, transferred_file: bool) {
+    if bytes == 0 && !transferred_file {
         return;
     }
     if let Some(observer) = BYTES_OBSERVER.get() {
-        observer(bytes);
+        observer(bytes, transferred_file);
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "rustcopycardapp"
-version = "2.8.0"
+version = "2.8.1"
 edition = "2021"
 description = "Camera card copy tool: sy mirror copy with XXH64 verification"
 license = "MIT"

@@ -1018,24 +1018,23 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     }),
                 };
 
-                // Update progress bar
-                let bytes_for_progress = match &task.action {
-                    SyncAction::Create | SyncAction::Update => {
-                        task.source.as_ref().map(|f| f.size).unwrap_or(0)
+                // rcca patch: report the bytes handled to the host, and whether one
+                // regular file was actually transferred. A skipped file already exists in
+                // the target, so it counts as done too; otherwise the overall progress
+                // could never reach 50%. A failed task counts for neither, it moved
+                // nothing and does not belong in the transfer count.
+                let (bytes_for_progress, transferred_file) = match (&task.action, result.is_ok()) {
+                    (SyncAction::Create | SyncAction::Update, true) => (
+                        task.source.as_ref().map(|f| f.size).unwrap_or(0),
+                        task.source.as_ref().map(|f| !f.is_dir).unwrap_or(false),
+                    ),
+                    (SyncAction::Skip, true) => {
+                        (task.source.as_ref().map(|f| f.size).unwrap_or(0), false)
                     }
-                    _ => 0,
+                    _ => (0, false),
                 };
                 pb.inc(bytes_for_progress);
-
-                // rcca patch: report the bytes handled to the host. A skipped file already
-                // exists in the target, so it counts as done too; otherwise the overall
-                // progress could never reach 50%.
-                crate::sync::progress::notify_bytes_accounted(match &task.action {
-                    SyncAction::Create | SyncAction::Update | SyncAction::Skip => {
-                        task.source.as_ref().map(|f| f.size).unwrap_or(0)
-                    }
-                    _ => 0,
-                });
+                crate::sync::progress::notify_bytes_accounted(bytes_for_progress, transferred_file);
 
                 result
             }

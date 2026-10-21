@@ -8,6 +8,9 @@ use std::sync::Mutex;
 pub const MAX_FAILURE_EXAMPLES: usize = 32;
 /// Upper bound on the bytes of kept failure detail.
 pub const MAX_FAILURE_DETAIL_BYTES: usize = 64 * 1024;
+/// --verbose keeps every failure it can, so its list is complete in practice.
+pub const VERBOSE_FAILURE_EXAMPLES: usize = 4096;
+pub const VERBOSE_FAILURE_DETAIL_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
 struct FailureLog {
@@ -17,12 +20,12 @@ struct FailureLog {
 }
 
 impl FailureLog {
-    fn record(&mut self, message: String) {
+    fn record(&mut self, message: String, max_examples: usize, max_bytes: usize) {
         self.count += 1;
-        if self.examples.len() >= MAX_FAILURE_EXAMPLES {
+        if self.examples.len() >= max_examples {
             return;
         }
-        if self.detail_bytes + message.len() > MAX_FAILURE_DETAIL_BYTES {
+        if self.detail_bytes + message.len() > max_bytes {
             return;
         }
         self.detail_bytes += message.len();
@@ -44,6 +47,7 @@ pub struct Stats {
     abort_reason: Mutex<Option<String>>,
     current: Mutex<String>,
     failures: Mutex<FailureLog>,
+    failure_limits: (usize, usize),
 }
 
 impl Default for Stats {
@@ -54,6 +58,15 @@ impl Default for Stats {
 
 impl Stats {
     pub fn new() -> Self {
+        Self::with_failure_limits(MAX_FAILURE_EXAMPLES, MAX_FAILURE_DETAIL_BYTES)
+    }
+
+    /// Same as `new`, but keeps the complete failure list instead of the first 32.
+    pub fn verbose() -> Self {
+        Self::with_failure_limits(VERBOSE_FAILURE_EXAMPLES, VERBOSE_FAILURE_DETAIL_BYTES)
+    }
+
+    pub fn with_failure_limits(examples: usize, detail_bytes: usize) -> Self {
         Self {
             copied_bytes: AtomicU64::new(0),
             hashed_bytes: AtomicU64::new(0),
@@ -64,6 +77,7 @@ impl Stats {
             abort_reason: Mutex::new(None),
             current: Mutex::new(String::new()),
             failures: Mutex::new(FailureLog::default()),
+            failure_limits: (examples, detail_bytes),
         }
     }
 
@@ -79,8 +93,9 @@ impl Stats {
 
     /// Record one failure; both the count and the detail are bounded.
     pub fn note_failure(&self, message: String) {
+        let (examples, detail_bytes) = self.failure_limits;
         if let Ok(mut log) = self.failures.lock() {
-            log.record(message);
+            log.record(message, examples, detail_bytes);
         }
     }
 
@@ -161,6 +176,16 @@ mod tests {
         }
         assert_eq!(stats.failure_count(), 100);
         assert_eq!(stats.failure_examples().len(), MAX_FAILURE_EXAMPLES);
+    }
+
+    #[test]
+    fn verbose_stats_keep_a_long_failure_list() {
+        let stats = Stats::verbose();
+        for i in 0..100 {
+            stats.note_failure(format!("failure {i}"));
+        }
+        assert_eq!(stats.failure_count(), 100);
+        assert_eq!(stats.failure_examples().len(), 100);
     }
 
     #[test]
