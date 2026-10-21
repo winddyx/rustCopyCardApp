@@ -4,12 +4,16 @@
 
 - Package `rustcopycardapp`; library and binary are both `rcca` (`[lib]` / `[[bin]]` in
   `Cargo.toml`).
-- Working branch `sy-wrapper` (copies go through the embedded sy). `main` is frozen at
-  `v1.0.2`, the hand-written engine, kept for reference only.
-- No git remote is configured. Per the global rules, only a personal fork is ever pushed
-  and upstream is never touched (no PRs, no issues).
+- Working branch `sy-wrapper` (copies go through the embedded sy). Local `main` is frozen
+  at `v1.0.2`, the hand-written engine, kept for reference only.
+- Remote `fork` is `git@github.com:winddyx/rustCopyCardApp.git`, the user's own public
+  repository; its `main` holds the `sy-wrapper` line of work
+  (`git push fork sy-wrapper:main`). Upstream nijaru/sy is never touched (no PRs, no
+  issues, no feature requests).
 - Behaviour changes bump `Cargo.toml` and add `git tag -a vX.Y.Z`; tags so far are
-  `v2.1.0` … `v2.6.0`.
+  `v2.1.0` … `v2.8.1`.
+- License: MIT (`LICENSE`, Copyright (c) 2026 winddyx). `vendor/sy` keeps its own MIT
+  license and copyright at `vendor/sy/LICENSE`; both notices must stay.
 
 ## Who does what
 
@@ -47,7 +51,7 @@
   target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
   armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
   the recipe creates under `target/armv7-support`.
-- `make test` (`cargo test`): 46 unit tests in `src/`, 20 integration tests in `tests/`
+- `make test` (`cargo test`): 53 unit tests in `src/`, 24 integration tests in `tests/`
   (`cli_flow.rs`, `failure_paths.rs`).
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
 

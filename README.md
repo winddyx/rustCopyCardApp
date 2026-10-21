@@ -162,7 +162,7 @@ shows the one file being worked on.
 ## Tests
 
 ```bash
-cargo test                                        # 66 tests (46 unit + 20 integration)
+cargo test                                        # 77 tests (53 unit + 24 integration)
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -179,3 +179,12 @@ code 1), and no partial final file after an interrupt.
 - Symlinks are copied as links; source mtime and permission bits match on the target.
 - The Windows artifact is cross compiled on `x86_64-pc-windows-gnu` and only depends on
   system DLLs.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 winddyx.
+
+The copy engine under `vendor/sy` is a modified copy of
+[nijaru/sy](https://github.com/nijaru/sy) v0.4.1, MIT licensed, Copyright (c) 2025
+Nick Russo; its license text is kept at `vendor/sy/LICENSE` and the local changes are
+listed in `vendor/sy/PATCHES.md`.
