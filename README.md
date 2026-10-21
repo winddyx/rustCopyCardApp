@@ -15,15 +15,28 @@ sy is vendored as source in `vendor/sy` (v0.4.1, with four small patches documen
 `vendor/sy/PATCHES.md`), so building needs neither network access nor a separate sy
 install.
 
-`make dist` produces:
+`make dist` produces five artifacts:
 
-- `dist/rcca-macos-arm64`: macOS arm64 executable.
-- `dist/rcca-windows-x64.exe`: Windows x64 executable (PE32+, system DLLs only).
-- `dist/SHA256SUMS`: SHA-256 of both, verify with `cd dist && shasum -a 256 -c SHA256SUMS`.
+- `dist/rcca-macos-arm64`: macOS arm64.
+- `dist/rcca-windows-x64.exe`: Windows x64 (PE32+, system DLLs only).
+- `dist/rcca-linux-x64`: Linux x86-64, static musl.
+- `dist/rcca-linux-armv7`: Linux ARMv7 hard-float (Raspberry Pi 2/3 in 32-bit mode), static musl.
+- `dist/rcca-linux-armv8`: Linux ARMv8 / aarch64, static musl.
+- `dist/SHA256SUMS`: SHA-256 of all five, verify with `cd dist && shasum -a 256 -c SHA256SUMS`.
 
-Cross compiling for Windows needs `rustup target add x86_64-pc-windows-gnu` and
-`brew install mingw-w64`. `make dist` calls `cargo build --release --target` after
-deleting `dist/`, so no stale artifact survives.
+The three Linux binaries are fully static (no glibc, no OpenSSL shared library), so they
+run on any distribution. Cross toolchains needed on macOS:
+
+```bash
+rustup target add x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf aarch64-unknown-linux-musl
+rustup target add x86_64-pc-windows-gnu     # Windows, plus: brew install mingw-w64
+brew install zig                            # C compiler/sysroot for the musl targets
+```
+
+`scripts/zig-cc.sh` and `scripts/zig-ar.sh` wrap `zig` as the cross C compiler;
+`rust-lld` from the toolchain does the linking. OpenSSL is built from source for the
+Linux targets (`vendor`-free, see `Cargo.toml`), so the first `make dist` after a clean
+takes a few minutes. Every run wipes `dist/` first, so no stale artifact survives.
 
 Other entry points: `make test` runs every test, `make lint` runs clippy plus the
 format check, `make clean` removes `target/` and `dist/`.

@@ -1,6 +1,6 @@
 [package]
 name = "rustcopycardapp"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 description = "Camera card copy tool: sy mirror copy with XXH64 verification"
 license = "MIT"
@@ -24,6 +24,10 @@ terminal_size = "0.4"
 thiserror = "2"
 unicode-width = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Cross compiling for Linux has no system OpenSSL, so link a vendored one there.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 assert_cmd = "2"

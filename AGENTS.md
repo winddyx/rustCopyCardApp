@@ -36,9 +36,17 @@
 
 ## Commands
 
-- `make dist`: wipes `dist/`, builds `aarch64-apple-darwin` and `x86_64-pc-windows-gnu`,
-  writes `dist/rcca-macos-arm64`, `dist/rcca-windows-x64.exe`, `dist/SHA256SUMS`.
-  Cross compiling needs `rustup target add x86_64-pc-windows-gnu` and Homebrew `mingw-w64`.
+- `make dist`: wipes `dist/`, then builds five targets: `aarch64-apple-darwin`,
+  `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-musl`,
+  `armv7-unknown-linux-musleabihf`, `aarch64-unknown-linux-musl`. Artifacts are
+  `dist/rcca-macos-arm64`, `dist/rcca-windows-x64.exe`, `dist/rcca-linux-x64`,
+  `dist/rcca-linux-armv7`, `dist/rcca-linux-armv8`, plus `SHA256SUMS`.
+- Cross compiling needs the rustup targets above, Homebrew `mingw-w64` for Windows, and
+  `zig` for the musl Linux targets. `scripts/zig-cc.sh` / `scripts/zig-ar.sh` wrap zig as
+  the C compiler, `rust-lld` links, and OpenSSL is vendored for Linux via a
+  target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
+  armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
+  the recipe creates under `target/armv7-support`.
 - `make test` (`cargo test`): 46 unit tests in `src/`, 20 integration tests in `tests/`
   (`cli_flow.rs`, `failure_paths.rs`).
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
