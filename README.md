@@ -104,13 +104,22 @@ VERIFY  100%   11.0/11.0 GiB  C7418.MP4
 The summary on stdout looks like this:
 
 ```
-source: /Volumes/CARD
-target: /Users/me/footage/2024-05-01
-files 1351, 40.3 GiB total, elapsed 07:12
-copy (sy, includes directories): 1351 created, 0 updated, 0 skipped, 0 deleted, 40.3 GiB transferred
-verify (XXH64): 1351 passed, 0 failed
-result: all files copied and verified with XXH64
+SRC  /Volumes/MOD/200 个人目录/David/BlackmagicCamera
+DST  /Volumes/MOD/200 个人目录/David/1020 01
+
+  Files      91 files · 5.6 GiB · 02:41
+  Copy       0 created · 0 updated · 91 skipped · 0 deleted
+  Transfer   0 files · 0 B
+  Verify     91 files · 5.6 GiB · 91/91 passed
+
+  ✓ All files copied and verified
 ```
+
+`Files` is the manifest (elapsed time at the end), `Copy` is sy's own accounting (it
+includes directory entries), `Transfer` counts regular files sy actually moved, and
+`Verify` reports the files checked, the bytes they hold and how many passed. On failure
+the last line becomes `! Failed: N problems, listed below` and an indented list follows;
+on Ctrl-C it becomes `! Interrupted: …`.
 
 Progress goes to stderr and stdout carries only the summary, so
 `rcca source target > log.txt` yields clean text. When stderr is not a TTY or `--quiet`

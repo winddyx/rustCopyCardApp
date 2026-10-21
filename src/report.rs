@@ -1,4 +1,8 @@
 //! Final summary, printed to stdout once the run is over.
+//!
+//! Layout: the two paths, a blank line, an indented block of aligned counters, a blank
+//! line and one result line. Failure detail, when there is any, follows as an indented
+//! list so the block above stays scannable.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,23 +15,30 @@ pub struct Summary {
     pub target: PathBuf,
     pub files_total: usize,
     pub bytes_total: u64,
-    /// Counters reported by sy.
+    pub elapsed: Duration,
+    /// Counters reported by sy; they include directory entries.
     pub created: u64,
     pub updated: u64,
     pub skipped: usize,
     pub deleted: usize,
+    /// Regular files sy actually copied, and the bytes it moved.
+    pub transferred_files: usize,
     pub bytes_transferred: u64,
     pub copy_errors: usize,
-    /// Results of rcca's own verification.
+    /// Files that passed verification, the bytes they hold, and the failures.
     pub verified: usize,
     pub verify_failed: usize,
-    pub elapsed: Duration,
+    pub verified_bytes: u64,
     pub failures: Vec<String>,
     pub verbose: bool,
     pub interrupted: bool,
 }
 
 const MAX_PRINTED_FAILURES: usize = 20;
+/// Label column of the counter block: `Transfer` is the longest label.
+const LABEL_W: usize = 11;
+/// Separator between values on one row.
+const SEP: &str = " · ";
 
 pub fn print(summary: &Summary) {
     let lines = render(summary);
@@ -38,39 +49,48 @@ pub fn print(summary: &Summary) {
 
 pub fn render(summary: &Summary) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(format!("source: {}", summary.source.display()));
-    lines.push(format!("target: {}", summary.target.display()));
-    lines.push(format!(
-        "files {}, {} total, elapsed {}",
-        summary.files_total,
-        human_bytes(summary.bytes_total),
-        human_duration(summary.elapsed.as_secs())
+    lines.push(format!("SRC  {}", summary.source.display()));
+    lines.push(format!("DST  {}", summary.target.display()));
+    lines.push(String::new());
+
+    lines.push(row(
+        "Files",
+        &format!(
+            "{} files{SEP}{}{SEP}{}",
+            summary.files_total,
+            human_bytes(summary.bytes_total),
+            human_duration(summary.elapsed.as_secs())
+        ),
+    ));
+    lines.push(row(
+        "Copy",
+        &format!(
+            "{} created{SEP}{} updated{SEP}{} skipped{SEP}{} deleted",
+            summary.created, summary.updated, summary.skipped, summary.deleted
+        ),
+    ));
+    lines.push(row(
+        "Transfer",
+        &format!(
+            "{} files{SEP}{}",
+            summary.transferred_files,
+            human_bytes(summary.bytes_transferred)
+        ),
     ));
 
-    // sy counts directory entries too; say so here so it cannot be confused with
-    // the file count above.
-    lines.push(format!(
-        "copy (sy, includes directories): {} created, {} updated, {} skipped, {} deleted, {} transferred",
-        summary.created,
-        summary.updated,
-        summary.skipped,
-        summary.deleted,
-        human_bytes(summary.bytes_transferred)
-    ));
-    if summary.copy_errors > 0 {
-        lines.push(format!("copy errors: {}", summary.copy_errors));
-    }
-    lines.push(format!(
-        "verify (XXH64): {} passed, {} failed",
-        summary.verified, summary.verify_failed
+    let verified_total = summary.verified + summary.verify_failed;
+    lines.push(row(
+        "Verify",
+        &format!(
+            "{verified_total} files{SEP}{}{SEP}{}/{} passed",
+            human_bytes(summary.verified_bytes),
+            summary.verified,
+            verified_total
+        ),
     ));
 
-    if summary.interrupted {
-        lines.push(
-            "interrupted: verification incomplete, the target may hold unverified files"
-                .to_string(),
-        );
-    }
+    lines.push(String::new());
+    lines.push(format!("  {}", result_line(summary)));
 
     if !summary.failures.is_empty() {
         let limit = if summary.verbose {
@@ -78,28 +98,36 @@ pub fn render(summary: &Summary) -> Vec<String> {
         } else {
             MAX_PRINTED_FAILURES.min(summary.failures.len())
         };
-        lines.push(format!("failures ({}):", summary.failures.len()));
+        lines.push(String::new());
         for failure in summary.failures.iter().take(limit) {
-            lines.push(format!("  - {failure}"));
+            lines.push(format!("    - {failure}"));
         }
         if limit < summary.failures.len() {
             lines.push(format!(
-                "  ... {} more, see --verbose",
+                "    ... {} more, see --verbose",
                 summary.failures.len() - limit
             ));
         }
     }
 
-    let ok = summary.failures.is_empty() && !summary.interrupted;
-    lines.push(if ok {
-        "result: all files copied and verified with XXH64".to_string()
-    } else if summary.interrupted {
-        "result: interrupted".to_string()
-    } else {
-        "result: failed, see the failure list above".to_string()
-    });
-
     lines
+}
+
+fn row(label: &str, value: &str) -> String {
+    format!("  {label:<LABEL_W$}{value}")
+}
+
+fn result_line(summary: &Summary) -> String {
+    if summary.interrupted {
+        return "! Interrupted: verification incomplete, the target may hold unverified files"
+            .to_string();
+    }
+    let problems = summary.failures.len() + summary.copy_errors;
+    if problems == 0 && summary.verify_failed == 0 {
+        return "✓ All files copied and verified".to_string();
+    }
+    let suffix = if problems == 1 { "" } else { "s" };
+    format!("! Failed: {problems} problem{suffix}, listed below")
 }
 
 #[cfg(test)]
@@ -112,15 +140,17 @@ mod tests {
             target: PathBuf::from("/out"),
             files_total: 2,
             bytes_total: 2048,
+            elapsed: Duration::from_secs(3),
             created: 2,
             updated: 0,
             skipped: 0,
             deleted: 0,
+            transferred_files: 2,
             bytes_transferred: 2048,
             copy_errors: 0,
             verified: 2,
             verify_failed: 0,
-            elapsed: Duration::from_secs(3),
+            verified_bytes: 2048,
             failures: Vec::new(),
             verbose: false,
             interrupted: false,
@@ -128,70 +158,112 @@ mod tests {
     }
 
     #[test]
-    fn copy_line_marks_sy_counting_includes_directories() {
-        let lines = render(&base());
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("copy (sy, includes directories): 2 created")),
-            "{lines:?}"
+    fn renders_the_reference_layout() {
+        let mut summary = base();
+        summary.files_total = 91;
+        summary.bytes_total = 6_010_000_000;
+        summary.created = 0;
+        summary.skipped = 91;
+        summary.transferred_files = 0;
+        summary.bytes_transferred = 0;
+        summary.verified = 91;
+        summary.verified_bytes = 6_010_000_000;
+
+        let lines = render(&summary);
+        assert_eq!(lines[0], "SRC  /card");
+        assert_eq!(lines[1], "DST  /out");
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "  Files      91 files · 5.6 GiB · 00:03");
+        assert_eq!(
+            lines[4],
+            "  Copy       0 created · 0 updated · 91 skipped · 0 deleted"
         );
+        assert_eq!(lines[5], "  Transfer   0 files · 0 B");
+        assert_eq!(lines[6], "  Verify     91 files · 5.6 GiB · 91/91 passed");
+        assert_eq!(lines[7], "");
+        assert_eq!(lines[8], "  ✓ All files copied and verified");
     }
 
     #[test]
-    fn file_count_and_elapsed_share_one_line() {
+    fn counter_values_start_at_the_same_column() {
         let lines = render(&base());
-        let line = lines
+        let columns: Vec<usize> = ["Files", "Copy", "Transfer", "Verify"]
             .iter()
-            .find(|l| l.starts_with("files "))
-            .expect("a files line");
-        assert_eq!(line, "files 2, 2.0 KiB total, elapsed 00:03");
+            .map(|label| {
+                let line = lines
+                    .iter()
+                    .find(|l| l.trim_start().starts_with(label))
+                    .expect("row");
+                let value_start = line.find(|c: char| c.is_ascii_digit()).expect("value");
+                line[..value_start].chars().count()
+            })
+            .collect();
         assert!(
-            !lines.iter().any(|l| l.starts_with("elapsed ")),
-            "elapsed must not get a line of its own: {lines:?}"
+            columns.windows(2).all(|w| w[0] == w[1]),
+            "columns must line up: {columns:?}"
         );
-    }
-
-    #[test]
-    fn success_summary_states_success() {
-        let lines = render(&base());
-        assert!(lines.iter().any(|l| l.contains("verify (XXH64): 2 passed")));
-        assert!(lines.last().unwrap().contains("all files copied"));
+        assert_eq!(columns[0], 2 + LABEL_W);
     }
 
     #[test]
     fn failures_are_limited_unless_verbose() {
         let mut summary = base();
         summary.failures = (0..30).map(|i| format!("f{i}")).collect();
-        let listed = |lines: &Vec<String>| {
-            lines
-                .iter()
-                .filter(|l| l.trim_start().starts_with("- f"))
-                .count()
-        };
         let lines = render(&summary);
-        assert_eq!(listed(&lines), 20);
+        assert_eq!(lines.iter().filter(|l| l.contains("- f")).count(), 20);
         summary.verbose = true;
         let lines = render(&summary);
-        assert_eq!(listed(&lines), 30);
+        assert_eq!(lines.iter().filter(|l| l.contains("- f")).count(), 30);
     }
 
     #[test]
-    fn interrupted_summary_is_explicit() {
+    fn failed_run_says_so_and_lists_the_detail() {
+        let mut summary = base();
+        summary.verified = 1;
+        summary.verify_failed = 1;
+        summary.copy_errors = 1;
+        summary.failures = vec!["a.bin: hash mismatch".to_string()];
+        let lines = render(&summary);
+        let result = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with('!'))
+            .expect("result line");
+        assert!(result.starts_with("  ! Failed: 2 problems"), "{result}");
+        assert_eq!(
+            lines.last().unwrap(),
+            "    - a.bin: hash mismatch",
+            "failure detail follows the result line: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_run_is_explicit() {
         let mut summary = base();
         summary.interrupted = true;
         let lines = render(&summary);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("interrupted: verification")));
-        assert!(lines.last().unwrap().contains("result: interrupted"));
+        assert!(
+            lines.iter().any(|l| l.starts_with("  ! Interrupted")),
+            "{lines:?}"
+        );
     }
 
     #[test]
-    fn copy_errors_are_reported_separately() {
+    fn a_single_problem_is_not_pluralised() {
         let mut summary = base();
-        summary.copy_errors = 3;
+        summary.verify_failed = 1;
+        summary.failures = vec!["a.bin: read failed".to_string()];
+        let result = render(&summary)
+            .into_iter()
+            .find(|l| l.trim_start().starts_with('!'))
+            .expect("result line");
+        assert!(result.contains("1 problem,"), "{result}");
+    }
+
+    #[test]
+    fn copy_errors_alone_do_not_claim_success() {
+        let mut summary = base();
+        summary.copy_errors = 2;
         let lines = render(&summary);
-        assert!(lines.iter().any(|l| l.contains("copy errors: 3")));
+        assert!(lines.last().unwrap().starts_with("  ! Failed: 2 problems"));
     }
 }

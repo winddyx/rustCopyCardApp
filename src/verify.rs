@@ -20,6 +20,8 @@ use crate::stats::Stats;
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     pub matched: usize,
+    /// Bytes held by the files that passed.
+    pub matched_bytes: u64,
     pub mismatched: Vec<String>,
     pub missing: Vec<String>,
     pub errors: Vec<String>,
@@ -94,7 +96,7 @@ fn disable_read_cache(_file: &File) {}
 
 /// What happened to one file, kept until the report is assembled in order.
 enum Outcome {
-    Matched,
+    Matched(u64),
     Missing(String),
     Mismatch(String),
     Failed(String),
@@ -147,7 +149,10 @@ pub fn run(
         .flatten()
     {
         match outcome {
-            Outcome::Matched => report.matched += 1,
+            Outcome::Matched(size) => {
+                report.matched += 1;
+                report.matched_bytes += size;
+            }
             Outcome::Missing(message) => report.missing.push(message),
             Outcome::Mismatch(message) => report.mismatched.push(message),
             Outcome::Failed(message) => report.errors.push(message),
@@ -177,7 +182,7 @@ fn verify_one(
     let dst_hash = hash_counted(&dst, buffer, opts, stats);
 
     let outcome = match (src_hash, dst_hash) {
-        (Ok(a), Ok(b)) if a == b => Outcome::Matched,
+        (Ok(a), Ok(b)) if a == b => Outcome::Matched(entry.size),
         (Ok(a), Ok(b)) => {
             let mut message = format!("{rel}: hash mismatch (source {a:016X}, target {b:016X})");
             if opts.keep_bad {

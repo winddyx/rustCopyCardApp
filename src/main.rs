@@ -160,15 +160,17 @@ fn run(cli: Cli) -> Result<i32> {
             target: target_root.clone(),
             files_total: 0,
             bytes_total: 0,
+            elapsed: started.elapsed(),
             created: 0,
             updated: 0,
             skipped: 0,
             deleted: 0,
+            transferred_files: 0,
             bytes_transferred: 0,
             copy_errors: 0,
             verified: 0,
             verify_failed: 0,
-            elapsed: started.elapsed(),
+            verified_bytes: 0,
             failures: Vec::new(),
             verbose: cli.verbose,
             interrupted: false,
@@ -192,6 +194,7 @@ fn run(cli: Cli) -> Result<i32> {
         engine::set_file_observer(move |path| {
             if let Some(name) = path.file_name() {
                 stats_for_name.set_current(name.to_string_lossy().into_owned());
+                stats_for_name.copied_files.fetch_add(1, Ordering::Relaxed);
             }
         });
         let stats_for_bytes = Arc::clone(&stats);
@@ -257,17 +260,19 @@ fn run(cli: Cli) -> Result<i32> {
         target: target_root.clone(),
         files_total: manifest.files.len(),
         bytes_total: manifest.total_bytes,
+        elapsed: started.elapsed(),
         created: copy.files_created,
         updated: copy.files_updated,
         skipped: copy.files_skipped + stats.files_skipped.load(Ordering::Relaxed),
         deleted: copy.files_deleted,
+        transferred_files: stats.copied_files.load(Ordering::Relaxed),
         bytes_transferred: copy.bytes_transferred,
         copy_errors: copy.errors.len(),
         verified: verify_report.matched,
         verify_failed: verify_report.mismatched.len()
             + verify_report.missing.len()
             + verify_report.errors.len(),
-        elapsed: started.elapsed(),
+        verified_bytes: verify_report.matched_bytes,
         failures,
         verbose: cli.verbose,
         interrupted,

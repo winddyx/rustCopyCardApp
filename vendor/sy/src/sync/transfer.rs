@@ -218,6 +218,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         }
 
         if !source.is_dir {
+            // rcca patch: updates skip copy_file, so report them here as well.
+            crate::sync::progress::notify_file_started(&source.path);
+
             // Use delta sync for updates
             let result = self
                 .transport

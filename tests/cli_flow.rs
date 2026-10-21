@@ -82,7 +82,7 @@ fn progress_goes_to_stderr_and_summary_to_stdout() {
 
     // The result lives on stdout only.
     assert!(
-        stdout.contains("result:"),
+        stdout.contains("✓ All files copied and verified"),
         "summary belongs on stdout: {stdout}"
     );
 }
@@ -119,15 +119,12 @@ fn copies_tree_and_verifies() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("4/4 passed"), "output: {stdout}");
+    assert!(stdout.contains("Transfer"), "output: {stdout}");
     assert!(
-        stdout.contains("verify (XXH64): 4 passed"),
+        stdout.contains("All files copied and verified"),
         "output: {stdout}"
     );
-    assert!(
-        stdout.contains("copy (sy, includes directories)"),
-        "output: {stdout}"
-    );
-    assert!(stdout.contains("all files copied"), "output: {stdout}");
 }
 
 #[test]
@@ -192,10 +189,7 @@ fn quiet_mode_prints_only_summary() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("verify (XXH64): 4 passed"),
-        "output: {stdout}"
-    );
+    assert!(stdout.contains("4/4 passed"), "output: {stdout}");
     assert!(
         !stdout.contains("\u{1b}["),
         "quiet mode must not emit ANSI codes"
@@ -225,7 +219,7 @@ fn rerun_skips_unchanged_files() {
         "the second run must not copy again: {stdout}"
     );
     assert!(
-        stdout.contains("0 B transferred"),
+        stdout.contains("Transfer   0 files · 0 B"),
         "the second run must not transfer: {stdout}"
     );
 }
@@ -278,7 +272,7 @@ fn symlinks_are_copied_but_not_verified() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("verify (XXH64): 1 passed"),
+        stdout.contains("1/1 passed"),
         "symlinks are not verified: {stdout}"
     );
 }

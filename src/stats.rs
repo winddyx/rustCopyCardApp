@@ -36,6 +36,8 @@ pub struct Stats {
     pub copied_bytes: AtomicU64,
     /// Bytes read during verification. Both sides are read, so this is twice the file size.
     pub hashed_bytes: AtomicU64,
+    /// Regular files sy actually copied (skipped files are not counted).
+    pub copied_files: AtomicUsize,
     pub files_skipped: AtomicUsize,
     pub cancel: AtomicBool,
     pub abort: AtomicBool,
@@ -55,6 +57,7 @@ impl Stats {
         Self {
             copied_bytes: AtomicU64::new(0),
             hashed_bytes: AtomicU64::new(0),
+            copied_files: AtomicUsize::new(0),
             files_skipped: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
             abort: AtomicBool::new(false),
