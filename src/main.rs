@@ -1,4 +1,5 @@
-//! rcca 入口：预检与遍历、交给内嵌的 sy 复制、rcca 校验、退出码映射。
+//! rcca entry point: preflight and traversal, copy through the embedded sy engine,
+//! rcca's own verification, then exit code mapping.
 
 use std::fs;
 use std::path::Path;
@@ -18,7 +19,7 @@ use rcca::stats::{human_bytes, Stats};
 use rcca::ui::{self, Live, Phase};
 use rcca::verify;
 
-/// 校验阶段每次读取的块大小。
+/// Chunk size used while hashing.
 const VERIFY_CHUNK: usize = 1024 * 1024;
 
 fn main() {
@@ -39,65 +40,68 @@ fn run(cli: Cli) -> Result<i32> {
     let style = ui::Style {
         color: ui::color_enabled(cli.color),
     };
-    // 运行期只有这一行文字进度：阶段、全程百分比、已完成/总量、当前文件。
+    // The only visible progress: phase, overall percentage, done/total and current file.
     let (mut live, view) = Live::start(Arc::clone(&stats), ui::interactive(cli.quiet), style);
 
-    // ---------- 阶段 1：参数与卷预检 ----------
+    // ---------- stage 1: arguments and volume preflight ----------
     let source = fs::canonicalize(&cli.source).map_err(|err| {
-        Error::preflight_io(format!("源目录不可用：{}", cli.source.display()), err)
+        Error::preflight_io(format!("source unavailable: {}", cli.source.display()), err)
     })?;
     if !source.is_dir() {
         return Err(Error::preflight(format!(
-            "源不是目录：{}",
+            "source is not a directory: {}",
             source.display()
         )));
     }
     fs::create_dir_all(&cli.target).map_err(|err| {
-        Error::preflight_io(format!("无法创建目标目录：{}", cli.target.display()), err)
+        Error::preflight_io(
+            format!("cannot create target directory: {}", cli.target.display()),
+            err,
+        )
     })?;
 
     let target_root = if cli.keep_source_name {
-        let name = source
-            .file_name()
-            .ok_or_else(|| Error::usage("源目录没有目录名，无法使用 --keep-source-name"))?;
+        let name = source.file_name().ok_or_else(|| {
+            Error::usage("source has no directory name, cannot use --keep-source-name")
+        })?;
         cli.target.join(name)
     } else {
         cli.target.clone()
     };
     fs::create_dir_all(&target_root)
-        .map_err(|err| Error::preflight_io("无法创建目标根目录", err))?;
+        .map_err(|err| Error::preflight_io("cannot create the target root", err))?;
     let target_root = fs::canonicalize(&target_root)
-        .map_err(|err| Error::preflight_io("无法解析目标根目录", err))?;
+        .map_err(|err| Error::preflight_io("cannot resolve the target root", err))?;
 
     if let Some(problem) = paths::nesting_problem(&source, &target_root) {
-        // 路径布局错误属于参数错误（退出码 2），不是运行期预检失败。
+        // A bad layout is an argument error (exit code 2), not a runtime preflight failure.
         return Err(Error::usage(problem));
     }
     check_writable(&target_root)?;
     if cli.clean_stale {
         let removed = clean_stale(&target_root);
         if removed > 0 && !cli.quiet {
-            eprintln!("rcca: 已清理 {removed} 个残留暂存文件");
+            eprintln!("rcca: removed {removed} leftover temp files");
         }
     }
 
     let fs_type = fs_type_name(&target_root);
 
-    // ---------- 阶段 2：遍历 source，检查 target ----------
+    // ---------- stage 2: walk the source, check the target ----------
     let mut manifest =
         scan::scan_with_progress(&source, &target_root, &mut |files| view.set_scanned(files))
-            .map_err(|err| Error::preflight_io("遍历源目录失败", err))?;
+            .map_err(|err| Error::preflight_io("traversing the source failed", err))?;
 
     if !manifest.errors.is_empty() {
         return Err(Error::preflight(format!(
-            "遍历源目录出现 {} 个错误，首条：{}",
+            "{} errors while traversing the source, first: {}",
             manifest.errors.len(),
             manifest.errors[0]
         )));
     }
     if !manifest.conflicts.is_empty() {
         return Err(Error::preflight(format!(
-            "路径规则冲突 {} 条，首条：{}",
+            "{} path rule conflicts, first: {}",
             manifest.conflicts.len(),
             manifest.conflicts[0]
         )));
@@ -113,14 +117,14 @@ fn run(cli: Cli) -> Result<i32> {
             manifest.total_bytes = manifest.files.iter().map(|e| e.size).sum();
             for (rel, err) in &unreadable {
                 stats.files_skipped.fetch_add(1, Ordering::Relaxed);
-                stats.note_failure(format!("跳过不可读文件 {}：{err}", rel.display()));
+                stats.note_failure(format!("skipping unreadable file {}: {err}", rel.display()));
             }
             if !cli.quiet {
-                eprintln!("rcca: 已跳过 {} 个不可读文件", unreadable.len());
+                eprintln!("rcca: skipped {} unreadable files", unreadable.len());
             }
         } else {
             return Err(Error::preflight(format!(
-                "{} 个源文件不可读（可用 --skip-unreadable 跳过），首条：{}",
+                "{} source files are unreadable (use --skip-unreadable to skip them), first: {}",
                 unreadable.len(),
                 unreadable[0].0.display()
             )));
@@ -131,7 +135,7 @@ fn run(cli: Cli) -> Result<i32> {
         let needed = manifest.total_bytes.saturating_mul(102) / 100 + 64 * 1024 * 1024;
         if free < needed && !cli.force {
             return Err(Error::preflight(format!(
-                "目标空间不足：可用 {}，需要 {}（可用 --force 跳过检查）",
+                "not enough space on the target: {} available, {} needed (use --force to continue)",
                 human_bytes(free),
                 human_bytes(needed)
             )));
@@ -142,7 +146,7 @@ fn run(cli: Cli) -> Result<i32> {
         const FAT32_MAX: u64 = 4 * 1024 * 1024 * 1024 - 1;
         if let Some(big) = manifest.files.iter().find(|e| e.size > FAT32_MAX) {
             return Err(Error::preflight(format!(
-                "目标卷为 FAT 系列文件系统，单文件上限 4 GiB，清单中存在 {}（{}）",
+                "the target volume is FAT, which caps files at 4 GiB, but the manifest holds {} ({})",
                 human_bytes(big.size),
                 big.rel.display()
             )));
@@ -173,16 +177,17 @@ fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
 
-    // ---------- 阶段 3：交给内嵌的 sy 引擎复制 ----------
+    // ---------- stage 3: copy through the embedded sy engine ----------
     view.set_total(manifest.total_bytes);
     view.set_phase(Phase::Copy);
 
     let engine_opts = EngineOptions {
         delete: true,
+        jobs: cli.jobs,
         max_errors: cli.fail_fast.then_some(1),
     };
     {
-        // sy 不打印任何进度；文件名与字节数通过两个回调交给界面。
+        // sy prints nothing; the file name and the byte count arrive through callbacks.
         let stats_for_name = Arc::clone(&stats);
         engine::set_file_observer(move |path| {
             if let Some(name) = path.file_name() {
@@ -199,15 +204,15 @@ fn run(cli: Cli) -> Result<i32> {
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
     for err in &copy.errors {
         stats.note_failure(format!(
-            "复制 {}：{}（{}）",
+            "copying {}: {} ({})",
             err.path.display(),
             err.error,
             err.action
         ));
     }
 
-    // ---------- 阶段 4：rcca 遍历并逐文件 XXH64 校验 ----------
-    // 复制阶段不拦截 Ctrl-C（交给内嵌 sy 自行结束），校验阶段才接管。
+    // ---------- stage 4: hash every file and compare ----------
+    // Ctrl-C is not intercepted during the copy (sy ends on its own); from here rcca owns it.
     install_signal_handler(&stats);
 
     let indices: Vec<usize> = (0..manifest.files.len()).collect();
@@ -229,21 +234,21 @@ fn run(cli: Cli) -> Result<i32> {
 
     let interrupted = stats.cancel.load(Ordering::SeqCst);
     if interrupted {
-        stats.note_failure("校验阶段被中断".to_string());
+        stats.note_failure("verification was interrupted".to_string());
     }
 
-    // ---------- 汇总 ----------
+    // ---------- summary ----------
     let mut failures = stats.failure_examples();
     failures.extend(verify_report.mismatched.clone());
     failures.extend(
         verify_report
             .missing
             .iter()
-            .map(|p| format!("{p}：目标文件缺失")),
+            .map(|p| format!("{p}: target file missing")),
     );
     failures.extend(verify_report.errors.clone());
     if let Some(reason) = stats.abort_reason() {
-        failures.push(format!("主动中止：{reason}"));
+        failures.push(format!("aborted on request: {reason}"));
     }
 
     let summary = Summary {
@@ -293,13 +298,13 @@ fn check_writable(root: &Path) -> Result<()> {
             Ok(())
         }
         Err(err) => Err(Error::preflight_io(
-            format!("目标目录不可写：{}", root.display()),
+            format!("target directory is not writable: {}", root.display()),
             err,
         )),
     }
 }
 
-/// 清理目标卷上遗留的 sy 暂存文件，返回删除数量。
+/// Remove leftover sy temp files from the target volume, returning how many went away.
 fn clean_stale(root: &Path) -> usize {
     let mut removed = 0usize;
     let mut pending = vec![root.to_path_buf()];

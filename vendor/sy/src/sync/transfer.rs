@@ -272,7 +272,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             create_progress_callback, notify_file_started, MIN_SIZE_FOR_PROGRESS,
         };
 
-        // rcca 补丁：每个文件开始复制时通知宿主，用于显示"当前文件"。
+        // rcca patch: tell the host when a file starts copying so it can show its name.
         notify_file_started(source);
 
         // Ensure parent directory exists

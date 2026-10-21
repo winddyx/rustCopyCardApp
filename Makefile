@@ -1,8 +1,8 @@
-# rustCopyCardApp / rcca 构建入口
+# rustCopyCardApp / rcca build entry points
 #
-# make dist   发行构建：先删除 dist/，再重建 macOS arm64 与 Windows x64，并生成 SHA256SUMS
-# make test   运行全部测试
-# make lint   clippy 与格式检查
+# make dist   release build: wipe dist/, rebuild macOS arm64 and Windows x64, write SHA256SUMS
+# make test   run all tests
+# make lint   clippy plus formatting check
 
 SHELL := /bin/bash
 
@@ -20,7 +20,7 @@ WIN_ARTIFACT := $(DIST)/$(BIN)-windows-x64.exe
 
 all: dist
 
-# 每次先删 dist/ 再完整重建，dist 只反映当前源码。
+# Every run wipes dist/ and rebuilds, so dist/ only ever reflects the current source.
 dist:
 	rm -rf $(DIST)
 	@echo "== rcca $(VERSION) =="
@@ -31,7 +31,7 @@ dist:
 	@ls -lh $(DIST)
 	@cat $(DIST)/SHA256SUMS
 
-# 兼容旧写法
+# kept for the old spelling
 makedist: dist
 
 macos-arm64:

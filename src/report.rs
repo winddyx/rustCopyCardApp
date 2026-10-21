@@ -1,4 +1,4 @@
-//! 结束时的汇总输出。
+//! Final summary, printed to stdout once the run is over.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,14 +11,14 @@ pub struct Summary {
     pub target: PathBuf,
     pub files_total: usize,
     pub bytes_total: u64,
-    /// sy 复制的统计。
+    /// Counters reported by sy.
     pub created: u64,
     pub updated: u64,
     pub skipped: usize,
     pub deleted: usize,
     pub bytes_transferred: u64,
     pub copy_errors: usize,
-    /// rcca 校验的结果。
+    /// Results of rcca's own verification.
     pub verified: usize,
     pub verify_failed: usize,
     pub elapsed: Duration,
@@ -38,21 +38,22 @@ pub fn print(summary: &Summary) {
 
 pub fn render(summary: &Summary) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(format!("源：{}", summary.source.display()));
-    lines.push(format!("目标：{}", summary.target.display()));
+    lines.push(format!("source: {}", summary.source.display()));
+    lines.push(format!("target: {}", summary.target.display()));
     lines.push(format!(
-        "文件 {} 个，共 {}",
+        "files {}, {} total",
         summary.files_total,
         human_bytes(summary.bytes_total)
     ));
     lines.push(format!(
-        "耗时 {}",
+        "elapsed {}",
         human_duration(summary.elapsed.as_secs())
     ));
 
-    // sy 的计数包含目录条目，这里按它的口径标注，避免与上面的文件数混淆。
+    // sy counts directory entries too; say so here so it cannot be confused with
+    // the file count above.
     lines.push(format!(
-        "复制（sy，含目录计数）：新建 {} 个，更新 {} 个，跳过 {} 个，删除 {} 个，传输 {}",
+        "copy (sy, includes directories): {} created, {} updated, {} skipped, {} deleted, {} transferred",
         summary.created,
         summary.updated,
         summary.skipped,
@@ -60,15 +61,18 @@ pub fn render(summary: &Summary) -> Vec<String> {
         human_bytes(summary.bytes_transferred)
     ));
     if summary.copy_errors > 0 {
-        lines.push(format!("复制报错 {} 个", summary.copy_errors));
+        lines.push(format!("copy errors: {}", summary.copy_errors));
     }
     lines.push(format!(
-        "校验（XXH64）：通过 {} 个，失败 {} 个",
+        "verify (XXH64): {} passed, {} failed",
         summary.verified, summary.verify_failed
     ));
 
     if summary.interrupted {
-        lines.push("已中断：校验未完成，目标目录中可能存在未校验的文件".to_string());
+        lines.push(
+            "interrupted: verification incomplete, the target may hold unverified files"
+                .to_string(),
+        );
     }
 
     if !summary.failures.is_empty() {
@@ -77,13 +81,13 @@ pub fn render(summary: &Summary) -> Vec<String> {
         } else {
             MAX_PRINTED_FAILURES.min(summary.failures.len())
         };
-        lines.push(format!("失败明细（{} 条）：", summary.failures.len()));
+        lines.push(format!("failures ({}):", summary.failures.len()));
         for failure in summary.failures.iter().take(limit) {
             lines.push(format!("  - {failure}"));
         }
         if limit < summary.failures.len() {
             lines.push(format!(
-                "  ... 其余 {} 条请用 --verbose 查看",
+                "  ... {} more, see --verbose",
                 summary.failures.len() - limit
             ));
         }
@@ -91,11 +95,11 @@ pub fn render(summary: &Summary) -> Vec<String> {
 
     let ok = summary.failures.is_empty() && !summary.interrupted;
     lines.push(if ok {
-        "结论：全部文件已复制并通过 XXH64 校验".to_string()
+        "result: all files copied and verified with XXH64".to_string()
     } else if summary.interrupted {
-        "结论：任务被中断".to_string()
+        "result: interrupted".to_string()
     } else {
-        "结论：任务失败，详见上面的失败明细".to_string()
+        "result: failed, see the failure list above".to_string()
     });
 
     lines
@@ -132,7 +136,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("复制（sy，含目录计数）：新建 2 个")),
+                .any(|l| l.contains("copy (sy, includes directories): 2 created")),
             "{lines:?}"
         );
     }
@@ -140,19 +144,25 @@ mod tests {
     #[test]
     fn success_summary_states_success() {
         let lines = render(&base());
-        assert!(lines.iter().any(|l| l.contains("校验（XXH64）：通过 2 个")));
-        assert!(lines.last().unwrap().contains("全部文件已复制"));
+        assert!(lines.iter().any(|l| l.contains("verify (XXH64): 2 passed")));
+        assert!(lines.last().unwrap().contains("all files copied"));
     }
 
     #[test]
     fn failures_are_limited_unless_verbose() {
         let mut summary = base();
         summary.failures = (0..30).map(|i| format!("f{i}")).collect();
+        let listed = |lines: &Vec<String>| {
+            lines
+                .iter()
+                .filter(|l| l.trim_start().starts_with("- f"))
+                .count()
+        };
         let lines = render(&summary);
-        assert_eq!(lines.iter().filter(|l| l.contains("f")).count(), 20);
+        assert_eq!(listed(&lines), 20);
         summary.verbose = true;
         let lines = render(&summary);
-        assert_eq!(lines.iter().filter(|l| l.contains("f")).count(), 30);
+        assert_eq!(listed(&lines), 30);
     }
 
     #[test]
@@ -160,8 +170,10 @@ mod tests {
         let mut summary = base();
         summary.interrupted = true;
         let lines = render(&summary);
-        assert!(lines.iter().any(|l| l.contains("已中断")));
-        assert!(lines.last().unwrap().contains("被中断"));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("interrupted: verification")));
+        assert!(lines.last().unwrap().contains("result: interrupted"));
     }
 
     #[test]
@@ -169,6 +181,6 @@ mod tests {
         let mut summary = base();
         summary.copy_errors = 3;
         let lines = render(&summary);
-        assert!(lines.iter().any(|l| l.contains("复制报错 3 个")));
+        assert!(lines.iter().any(|l| l.contains("copy errors: 3")));
     }
 }

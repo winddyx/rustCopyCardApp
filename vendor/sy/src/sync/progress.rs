@@ -18,34 +18,34 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// rcca 补丁：文件开始复制时的观察者，由宿主注册。
+/// rcca patch: observer fired when a file starts copying, registered by the host.
 pub type FileObserver = dyn Fn(&Path) + Send + Sync;
 
 static FILE_OBSERVER: std::sync::OnceLock<Box<FileObserver>> = std::sync::OnceLock::new();
 
-/// 注册文件开始复制的观察者；重复注册时忽略后一次。
+/// Register the file-start observer; later registrations are ignored.
 pub fn set_file_observer(observer: Box<FileObserver>) {
     let _ = FILE_OBSERVER.set(observer);
 }
 
-/// 通知观察者某个文件开始复制。
+/// Tell the observer that a file started copying.
 pub fn notify_file_started(path: &Path) {
     if let Some(observer) = FILE_OBSERVER.get() {
         observer(path);
     }
 }
 
-/// rcca 补丁：任务处理完毕的字节数观察者，宿主用它算总进度。
+/// rcca patch: observer for bytes handled per finished task, used for overall progress.
 pub type BytesObserver = dyn Fn(u64) + Send + Sync;
 
 static BYTES_OBSERVER: std::sync::OnceLock<Box<BytesObserver>> = std::sync::OnceLock::new();
 
-/// 注册字节数观察者；重复注册时忽略后一次。
+/// Register the byte-count observer; later registrations are ignored.
 pub fn set_bytes_observer(observer: Box<BytesObserver>) {
     let _ = BYTES_OBSERVER.set(observer);
 }
 
-/// 通知观察者某个任务已处理完的字节数（新建、更新与跳过都算）。
+/// Report the bytes of a finished task (create, update and skip all count).
 pub fn notify_bytes_accounted(bytes: u64) {
     if bytes == 0 {
         return;

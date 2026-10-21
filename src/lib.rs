@@ -1,6 +1,7 @@
-//! rustCopyCardApp 核心库：复制交给内嵌的 sy 引擎，遍历与 XXH64 校验由本工具完成。
+//! rustCopyCardApp core library: copying is delegated to the embedded sy engine,
+//! traversal and XXH64 verification are done here.
 //!
-//! 二进制入口见 `src/main.rs`，二进制名为 `rcca`。
+//! The binary entry point is `src/main.rs`, the binary is named `rcca`.
 
 pub mod cli;
 pub mod engine;

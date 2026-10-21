@@ -1,4 +1,4 @@
-//! 失败路径测试：预检失败、复制冲突、中断、逐文件失败。
+//! Failure paths: preflight failures, copy conflicts, interrupts, per-file errors.
 
 use std::fs;
 use std::path::Path;
@@ -9,7 +9,7 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 fn rcca() -> Command {
-    Command::cargo_bin("rcca").expect("构建 rcca 二进制")
+    Command::cargo_bin("rcca").expect("building the rcca binary")
 }
 
 fn write_file(root: &Path, rel: &str, data: &[u8]) {
@@ -58,7 +58,7 @@ fn unreadable_source_fails_preflight() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
 
     let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
-    // root 用户下读取仍会成功，此时任务正常完成。
+    // Reading still succeeds as root; the run then completes normally.
     if output.status.code() != Some(0) {
         assert_eq!(output.status.code(), Some(3));
     }
@@ -89,7 +89,7 @@ fn skip_unreadable_copies_the_rest() {
         assert_eq!(
             output.status.code(),
             Some(1),
-            "跳过不可读文件后应仅失败在个别文件"
+            "with --skip-unreadable only individual files may fail"
         );
     }
     assert!(dst.path().join("ok.bin").exists());
@@ -97,7 +97,8 @@ fn skip_unreadable_copies_the_rest() {
 
 #[test]
 fn deletion_threshold_aborts_mirror() {
-    // 目标里大部分文件在源中不存在：sy 默认 --max-delete 50% 会拒绝删除并报错。
+    // Most target files are absent from the source: sy's default --max-delete 50%
+    // refuses and reports an error.
     let src = TempDir::new().unwrap();
     let dst = TempDir::new().unwrap();
     write_file(src.path(), "keep.bin", b"keep");
@@ -106,16 +107,16 @@ fn deletion_threshold_aborts_mirror() {
     write_file(dst.path(), "other2.bin", b"stale");
 
     let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
-    assert_eq!(output.status.code(), Some(1), "复制失败应返回 1");
+    assert_eq!(output.status.code(), Some(1), "a copy failure returns 1");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("复制失败"), "stderr：{stderr}");
+    assert!(stderr.contains("copy failed"), "stderr: {stderr}");
     assert!(
         stderr.contains("Deletion threshold"),
-        "应保留 sy 的删除保护：{stderr}"
+        "sy's delete guard must stay: {stderr}"
     );
     assert!(
         dst.path().join("other1.bin").exists() && dst.path().join("other2.bin").exists(),
-        "拒绝删除时目标文件应保持原样"
+        "the target must stay untouched when deletion is refused"
     );
 }
 
@@ -128,7 +129,7 @@ fn path_with_tmp_suffix_is_rejected() {
     let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
     assert_eq!(output.status.code(), Some(3));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("路径规则冲突"), "stderr：{stderr}");
+    assert!(stderr.contains("path rule conflicts"), "stderr: {stderr}");
 }
 
 #[test]
@@ -174,16 +175,16 @@ fn sigint_never_leaves_a_partial_final_file() {
 
     let final_path = dst.path().join("big.bin");
     if final_path.exists() {
-        // 只有完整复制后才允许出现最终文件名。
+        // The final file name may only appear after a complete copy.
         assert_eq!(
             fs::metadata(&final_path).unwrap().len(),
             SIZE as u64,
-            "中断后不应留下不完整的最终文件"
+            "no incomplete final file may survive an interrupt"
         );
     } else {
         assert!(
             status.code().is_none() || status.code() == Some(130),
-            "被中断时退出码应为 130 或被信号终止：{:?}",
+            "an interrupt exits with 130 or is killed by the signal: {:?}",
             status.code()
         );
     }

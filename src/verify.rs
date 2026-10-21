@@ -1,4 +1,4 @@
-//! 阶段 4：逐个文件计算源与目标的 XXH64 并比较。
+//! Verification pass: hash source and target for every file and compare the XXH64 digests.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -32,13 +32,13 @@ pub struct Options {
     pub no_cache: bool,
 }
 
-/// 计算单个文件的 XXH64（seed = 0），不汇报中间进度。
+/// Compute the XXH64 of a file (seed = 0) without reporting progress.
 pub fn hash_file(path: &Path, chunk: usize, no_cache: bool) -> io::Result<u64> {
     let mut buffer = vec![0u8; chunk];
     hash_stream(path, &mut buffer, no_cache, &mut |_| {})
 }
 
-/// 分块读取并计算 XXH64，每读一块调用一次 `on_chunk`（参数是块大小）。
+/// Read a file in chunks and hash it, calling `on_chunk` once per chunk.
 pub fn hash_stream(
     path: &Path,
     buffer: &mut [u8],
@@ -67,7 +67,7 @@ pub fn hash_stream(
 #[cfg(target_os = "macos")]
 fn disable_read_cache(file: &File) {
     use std::os::fd::AsRawFd;
-    // F_NOCACHE = 48：让读取绕过统一缓冲，使哈希来自设备。
+    // F_NOCACHE = 48: bypass the unified buffer cache so the hash comes from the device.
     unsafe {
         libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
     }
@@ -84,7 +84,7 @@ fn disable_read_cache(file: &File) {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn disable_read_cache(_file: &File) {}
 
-/// 执行阶段 4，只校验阶段 3 已提交的条目。
+/// Verify the entries that were committed by the copy phase.
 pub fn run(
     files: &[Entry],
     committed: &[usize],
@@ -124,26 +124,27 @@ pub fn run(
             }
             (Ok(a), Ok(b)) => {
                 stats.verify_bad.fetch_add(1, Ordering::Relaxed);
-                let mut message = format!("{rel}：哈希不一致（源 {:016X}，目标 {:016X}）", a, b);
+                let mut message =
+                    format!("{rel}: hash mismatch (source {a:016X}, target {b:016X})");
                 if opts.keep_bad {
                     let bad = target.join(bad_rel_path(entry.rel.as_path()));
                     match fs::rename(&dst, &bad) {
-                        Ok(()) => message.push_str("，已隔离为 .badhash"),
+                        Ok(()) => message.push_str(", quarantined as .badhash"),
                         Err(err) => {
-                            message.push_str(&format!("，隔离失败：{err}"));
+                            message.push_str(&format!(", quarantine failed: {err}"));
                         }
                     }
                 } else {
                     match fs::remove_file(&dst) {
-                        Ok(()) => message.push_str("，已删除目标文件"),
-                        Err(err) => message.push_str(&format!("，删除失败：{err}")),
+                        Ok(()) => message.push_str(", target file deleted"),
+                        Err(err) => message.push_str(&format!(", delete failed: {err}")),
                     }
                 }
                 report.mismatched.push(message);
             }
             (Err(err), _) | (_, Err(err)) => {
                 stats.verify_bad.fetch_add(1, Ordering::Relaxed);
-                report.errors.push(format!("{rel}：读取失败 {err}"));
+                report.errors.push(format!("{rel}: read failed: {err}"));
             }
         }
 
@@ -152,14 +153,14 @@ pub fn run(
             .next()
             .flatten()
         {
-            report.errors.push(format!("{rel}：{}", issue.describe()));
+            report.errors.push(format!("{rel}: {}", issue.describe()));
         }
     }
 
     report
 }
 
-/// 计算哈希并把读过的字节累加进统计，界面据此显示进度。
+/// Hash a file and add the bytes read to the stats the progress line reads.
 fn hash_counted(path: &Path, buffer: &mut [u8], opts: &Options, stats: &Stats) -> io::Result<u64> {
     let hashed = &stats.hashed_bytes;
     hash_stream(path, buffer, opts.no_cache, &mut |n| {
@@ -219,7 +220,7 @@ mod tests {
         assert_eq!(report.mismatched.len(), 1);
         assert!(
             !dst.path().join("f.bin").exists(),
-            "默认删除不一致的目标文件"
+            "a mismatching target file is deleted by default"
         );
     }
 

@@ -1,38 +1,42 @@
-//! 路径规则：相对路径类型、tmp 命名、目标布局与路径长度检查。
+//! Path rules: the relative path type, temp naming, target layout and length checks.
 //!
-//! 引擎内部只传递相对源根的路径（`RelPath`），不把任意绝对路径透传到复制与校验逻辑。
+//! The engine only passes paths relative to the source root (`RelPath`); arbitrary
+//! absolute paths never reach the copy or verify logic.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-/// sy 引擎的暂存文件名前缀与后缀：`.sy-xxxxxxxx.tmp`。
+/// Temp file prefix and suffix used by sy: `.sy-xxxxxxxx.tmp`.
 pub const TMP_PREFIX: &str = ".sy-";
 pub const TMP_SUFFIX: &str = ".tmp";
-/// 校验失败时的隔离后缀。
+/// Suffix used to quarantine a file that failed verification.
 pub const BAD_SUFFIX: &str = ".badhash";
 
-/// 相对源根、已校验的路径。
+/// A path relative to the source root, validated on construction.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RelPath(PathBuf);
 
 impl RelPath {
-    /// 构造并校验：必须是相对路径，且不含 `..`、不含根前缀。
+    /// Build and validate: must be relative, without `..` and without a root prefix.
     pub fn new(path: impl Into<PathBuf>) -> std::result::Result<Self, String> {
         let path = path.into();
         if path.as_os_str().is_empty() {
-            return Err("相对路径为空".to_string());
+            return Err("relative path is empty".to_string());
         }
         if path.is_absolute() {
-            return Err(format!("相对路径不能是绝对路径：{}", path.display()));
+            return Err(format!("relative path is absolute: {}", path.display()));
         }
         for comp in path.components() {
             match comp {
                 Component::Normal(_) | Component::CurDir => {}
                 Component::ParentDir => {
-                    return Err(format!("相对路径不能包含 ..：{}", path.display()));
+                    return Err(format!("relative path contains ..: {}", path.display()));
                 }
                 Component::RootDir | Component::Prefix(_) => {
-                    return Err(format!("相对路径不能包含根前缀：{}", path.display()));
+                    return Err(format!(
+                        "relative path has a root prefix: {}",
+                        path.display()
+                    ));
                 }
             }
         }
@@ -47,7 +51,7 @@ impl RelPath {
         self.0
     }
 
-    /// 用于日志与界面展示；文件名可能是非 UTF-8，此处有损转换仅用于显示。
+    /// Used for logs and display; the file name may not be UTF-8, so this is lossy.
     pub fn display(&self) -> String {
         self.0.to_string_lossy().into_owned()
     }
@@ -61,7 +65,7 @@ impl RelPath {
     }
 }
 
-/// 校验失败时的隔离路径：同目录下 `.<name>.badhash`。
+/// Quarantine path for a file that failed verification: `.<name>.badhash` next to it.
 pub fn bad_rel_path(rel: &Path) -> PathBuf {
     let parent = rel.parent().unwrap_or_else(|| Path::new(""));
     let name = rel.file_name().unwrap_or_default();
@@ -75,28 +79,29 @@ pub fn bad_rel_path(rel: &Path) -> PathBuf {
     }
 }
 
-/// 文件名是否形如 sy 的暂存文件（同时兼容旧版 rcca 的 `.rcptmp`）。
+/// Whether a name looks like one of sy's temp files (older rcca `.rcptmp` too).
 pub fn looks_like_tmp(name: &std::ffi::OsStr) -> bool {
     let s = name.to_string_lossy();
     (s.starts_with(TMP_PREFIX) && s.ends_with(TMP_SUFFIX))
         || (s.starts_with('.') && s.ends_with(".rcptmp") && s.len() > ".rcptmp".len() + 1)
 }
 
-/// 目标根是否等于源根或位于其内 / 反之。两者都已规范化。
+/// Whether the target root equals the source root or sits inside it, or the other
+/// way round. Both paths must already be canonical.
 pub fn nesting_problem(source: &Path, target: &Path) -> Option<String> {
     if source == target {
-        return Some("源与目标是同一个目录".to_string());
+        return Some("source and target are the same directory".to_string());
     }
     if target.starts_with(source) {
         return Some(format!(
-            "目标目录位于源目录内（会自复制递归）：源 {}，目标 {}",
+            "target is inside the source (the copy would recurse into itself): source {}, target {}",
             source.display(),
             target.display()
         ));
     }
     if source.starts_with(target) {
         return Some(format!(
-            "源目录位于目标目录内（会与目标内容混在一起）：源 {}，目标 {}",
+            "source is inside the target (their contents would mix): source {}, target {}",
             source.display(),
             target.display()
         ));
@@ -104,12 +109,12 @@ pub fn nesting_problem(source: &Path, target: &Path) -> Option<String> {
     None
 }
 
-/// 目标根 + 相对路径的路径长度与单段长度是否超限。
+/// Whether target root plus relative path exceeds the platform path or component limit.
 pub fn path_problems(rel: &Path, target_root: &Path) -> Option<String> {
     let total = target_root.as_os_str().len() + 1 + rel.as_os_str().len();
     if total > path_limit() {
         return Some(format!(
-            "路径总长度 {} 超过平台上限 {}：{}",
+            "path length {} exceeds the platform limit {}: {}",
             total,
             path_limit(),
             target_root.join(rel).display()
@@ -119,7 +124,7 @@ pub fn path_problems(rel: &Path, target_root: &Path) -> Option<String> {
         let len = comp.as_os_str().len();
         if len > 255 {
             return Some(format!(
-                "单段文件名长度 {} 超过 255：{}",
+                "file name component length {} exceeds 255: {}",
                 len,
                 rel.display()
             ));
@@ -143,7 +148,7 @@ fn path_limit() -> usize {
     }
 }
 
-/// 把 Windows 上不合法或保留的字符问题暴露给预检（其它平台恒为空）。
+/// Report illegal or reserved Windows names to the preflight (always empty elsewhere).
 pub fn windows_name_problems(rel: &Path) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
@@ -154,11 +159,13 @@ pub fn windows_name_problems(rel: &Path) -> Option<String> {
         for comp in rel.components() {
             let s = comp.as_os_str().to_string_lossy();
             if s.contains(['<', '>', ':', '"', '|', '?', '*']) || s.ends_with(['.', ' ']) {
-                return Some(format!("文件名包含 Windows 不允许的字符：{s}"));
+                return Some(format!(
+                    "file name contains characters Windows rejects: {s}"
+                ));
             }
             let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
             if RESERVED.contains(&stem.as_str()) {
-                return Some(format!("文件名是 Windows 保留名：{s}"));
+                return Some(format!("file name is a reserved Windows name: {s}"));
             }
         }
         None

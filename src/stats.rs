@@ -1,11 +1,12 @@
-//! 运行统计：原子字节计数、有界失败清单、取消与中止标志、当前文件。
+//! Run state shared between the worker threads: atomic byte counters, a bounded
+//! failure list, cancellation flags and the current file.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// 失败样例条数上限。
+/// Upper bound on kept failure examples.
 pub const MAX_FAILURE_EXAMPLES: usize = 32;
-/// 失败样例明细的字节上限。
+/// Upper bound on the bytes of kept failure detail.
 pub const MAX_FAILURE_DETAIL_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -29,11 +30,11 @@ impl FailureLog {
     }
 }
 
-/// 三个线程共享的运行状态。
+/// State shared by the copy observer, the verify loop and the progress line.
 pub struct Stats {
-    /// 复制阶段已处理的字节数（新建、更新完成或跳过时累加）。
+    /// Bytes handled by the copy phase: added when a file is created, updated or skipped.
     pub copied_bytes: AtomicU64,
-    /// 校验阶段读过的字节数，源与目标两侧都算，所以是文件大小的两倍。
+    /// Bytes read during verification. Both sides are read, so this is twice the file size.
     pub hashed_bytes: AtomicU64,
     pub files_skipped: AtomicUsize,
     pub verify_ok: AtomicUsize,
@@ -77,7 +78,7 @@ impl Stats {
         self.current.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// 记录一条失败，条数与明细都受上限约束。
+    /// Record one failure; both the count and the detail are bounded.
     pub fn note_failure(&self, message: String) {
         if let Ok(mut log) = self.failures.lock() {
             log.record(message);
@@ -113,10 +114,10 @@ impl Stats {
     }
 }
 
-/// 二进制前缀单位。
+/// Binary prefixes.
 pub const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
-/// 把字节数拆成数值与单位，便于界面按固定列宽对齐。
+/// Split a byte count into value and unit so callers can align columns.
 pub fn human_bytes_parts(bytes: u64) -> (f64, &'static str) {
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -127,7 +128,7 @@ pub fn human_bytes_parts(bytes: u64) -> (f64, &'static str) {
     (value, BYTE_UNITS[unit])
 }
 
-/// 把字节数格式化为便于阅读的单位（二进制前缀）。
+/// Format a byte count with binary prefixes.
 pub fn human_bytes(bytes: u64) -> String {
     let (value, unit) = human_bytes_parts(bytes);
     if unit == "B" {
@@ -137,7 +138,7 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// 把秒数格式化为 mm:ss 或 hh:mm:ss。
+/// Format seconds as mm:ss or hh:mm:ss.
 pub fn human_duration(seconds: u64) -> String {
     let s = seconds % 60;
     let m = (seconds / 60) % 60;
@@ -157,11 +158,10 @@ mod tests {
     fn failure_log_is_bounded() {
         let stats = Stats::new();
         for i in 0..100 {
-            stats.note_failure(format!("失败 {i}"));
+            stats.note_failure(format!("failure {i}"));
         }
         assert_eq!(stats.failure_count(), 100);
         assert_eq!(stats.failure_examples().len(), MAX_FAILURE_EXAMPLES);
-        assert_eq!(stats.failure_count(), 100);
     }
 
     #[test]

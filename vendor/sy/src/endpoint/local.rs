@@ -164,7 +164,7 @@ impl Endpoint for LocalEndpoint {
         tokio::fs::symlink(target, &full_dest).await?;
         #[cfg(windows)]
         {
-            // Windows 需要区分文件与目录符号链接。
+            // rcca patch: Windows needs to tell file and directory symlinks apart.
             match tokio::fs::symlink_metadata(target).await {
                 Ok(meta) if meta.is_dir() => tokio::fs::symlink_dir(target, &full_dest).await?,
                 _ => tokio::fs::symlink_file(target, &full_dest).await?,

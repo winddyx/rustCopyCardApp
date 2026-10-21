@@ -1,4 +1,4 @@
-//! 端到端流程测试：正常复制、覆盖、镜像删除、布局、输出模式。
+//! End-to-end flows: plain copy, overwrite, mirror delete, layout, output modes.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 fn rcca() -> Command {
-    Command::cargo_bin("rcca").expect("构建 rcca 二进制")
+    Command::cargo_bin("rcca").expect("building the rcca binary")
 }
 
 fn write_file(root: &Path, rel: &str, data: &[u8]) {
@@ -62,23 +62,29 @@ fn progress_goes_to_stderr_and_summary_to_stdout() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // 管道下没有 TTY：不绘制进度行，stderr 只剩可能出现的告警。
+    // Piped stderr has no TTY: no progress line, only warnings if any.
     assert!(
         !stdout.contains('\u{1b}'),
-        "stdout 不应带控制序列：{stdout}"
+        "stdout must not carry escape sequences: {stdout}"
     );
     assert!(
         !stderr.contains("\u{1b}["),
-        "非 TTY 时不应绘制进度行：{stderr}"
+        "no progress line without a TTY: {stderr}"
     );
-    assert!(!stderr.contains('\r'), "非 TTY 时不应回车刷新：{stderr}");
+    assert!(
+        !stderr.contains('\r'),
+        "no carriage returns without a TTY: {stderr}"
+    );
     assert!(
         !stderr.contains("COPY") && !stderr.contains("VERIFY"),
-        "非 TTY 时不应有进度文字：{stderr}"
+        "no progress text without a TTY: {stderr}"
     );
 
-    // 结果只在 stdout。
-    assert!(stdout.contains("结论："), "汇总应在 stdout：{stdout}");
+    // The result lives on stdout only.
+    assert!(
+        stdout.contains("result:"),
+        "summary belongs on stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -100,22 +106,28 @@ fn copies_tree_and_verifies() {
     ] {
         let a = fs::read(src.path().join(rel)).unwrap();
         let b = fs::read(dst.path().join(rel)).unwrap();
-        assert_eq!(a, b, "{rel} 内容不一致");
+        assert_eq!(a, b, "{rel} content differs");
     }
 
     let leftovers: Vec<PathBuf> = collect_files(dst.path())
         .into_iter()
         .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(".sy-"))
         .collect();
-    assert!(leftovers.is_empty(), "不应残留 sy 暂存文件：{leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "no sy temp files may be left behind: {leftovers:?}"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("校验（XXH64）：通过 4 个"),
-        "输出：{stdout}"
+        stdout.contains("verify (XXH64): 4 passed"),
+        "output: {stdout}"
     );
-    assert!(stdout.contains("复制（sy，含目录计数）"), "输出：{stdout}");
-    assert!(stdout.contains("全部文件已复制"), "输出：{stdout}");
+    assert!(
+        stdout.contains("copy (sy, includes directories)"),
+        "output: {stdout}"
+    );
+    assert!(stdout.contains("all files copied"), "output: {stdout}");
 }
 
 #[test]
@@ -142,9 +154,12 @@ fn mirror_deletes_target_extras() {
 
     let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
     assert!(output.status.success());
-    assert!(!dst.path().join("stale.bin").exists(), "镜像应删除多余文件");
+    assert!(
+        !dst.path().join("stale.bin").exists(),
+        "the mirror must delete extra files"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("删除 1 个"), "输出：{stdout}");
+    assert!(stdout.contains("1 deleted"), "output: {stdout}");
 }
 
 #[test]
@@ -178,11 +193,17 @@ fn quiet_mode_prints_only_summary() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("校验（XXH64）：通过 4 个"),
-        "输出：{stdout}"
+        stdout.contains("verify (XXH64): 4 passed"),
+        "output: {stdout}"
     );
-    assert!(!stdout.contains("\u{1b}["), "quiet 模式不应有 ANSI 控制符");
-    assert!(!stdout.contains("rcca: 提示"), "quiet 模式不应有提示行");
+    assert!(
+        !stdout.contains("\u{1b}["),
+        "quiet mode must not emit ANSI codes"
+    );
+    assert!(
+        !stdout.contains("rcca:"),
+        "quiet mode must not print notices"
+    );
 }
 
 #[test]
@@ -199,8 +220,14 @@ fn rerun_skips_unchanged_files() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("新建 0 个"), "第二遍不应重复复制：{stdout}");
-    assert!(stdout.contains("传输 0 B"), "第二遍不应传输数据：{stdout}");
+    assert!(
+        stdout.contains("0 created"),
+        "the second run must not copy again: {stdout}"
+    );
+    assert!(
+        stdout.contains("0 B transferred"),
+        "the second run must not transfer: {stdout}"
+    );
 }
 
 #[test]
@@ -247,12 +274,12 @@ fn symlinks_are_copied_but_not_verified() {
             .unwrap()
             .file_type()
             .is_symlink(),
-        "sy 默认按符号链接复制"
+        "sy copies symlinks as links by default"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("校验（XXH64）：通过 1 个"),
-        "符号链接不进入校验清单：{stdout}"
+        stdout.contains("verify (XXH64): 1 passed"),
+        "symlinks are not verified: {stdout}"
     );
 }
 

@@ -1,9 +1,9 @@
 use std::fmt;
 
-/// 顶层错误分类，直接映射到退出码。
+/// Top-level error classes, mapped directly to exit codes.
 ///
-/// 退出码约定：
-/// 0 成功；1 复制或校验失败；2 用法错误；3 预检失败；130 被中断。
+/// Exit codes: 0 success; 1 copy or verify failure; 2 usage error; 3 preflight failure;
+/// 130 interrupted.
 #[derive(Debug)]
 pub enum Error {
     Usage(String),
@@ -33,16 +33,16 @@ impl Error {
     }
 
     pub fn preflight_io(context: impl fmt::Display, err: std::io::Error) -> Self {
-        Error::Preflight(format!("{context}：{err}"))
+        Error::Preflight(format!("{context}: {err}"))
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Usage(m) => write!(f, "用法错误：{m}"),
-            Error::Preflight(m) => write!(f, "预检失败：{m}"),
-            Error::Copy(m) => write!(f, "复制失败：{m}"),
+            Error::Usage(m) => write!(f, "usage error: {m}"),
+            Error::Preflight(m) => write!(f, "preflight failed: {m}"),
+            Error::Copy(m) => write!(f, "copy failed: {m}"),
         }
     }
 }

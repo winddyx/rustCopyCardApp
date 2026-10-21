@@ -1,75 +1,90 @@
-//! 命令行参数解析。
+//! Command line parsing.
 
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
-/// 进度与状态的颜色策略。
+/// Colour policy for the live progress line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ColorChoice {
-    /// 交给环境判断（NO_COLOR、TERM、TTY）
+    /// Decide from the environment (NO_COLOR, TERM, TTY)
     Auto,
-    /// 始终上色
+    /// Always use colour
     Always,
-    /// 从不上色
+    /// Never use colour
     Never,
 }
 
-/// 相机存储卡复制工具：sy 镜像复制 + XXH64 校验。
+/// Camera card copy tool: sy mirror copy plus XXH64 verification.
 #[derive(Debug, Parser)]
 #[command(
     name = "rcca",
     version,
-    about = "相机存储卡复制工具：sy 镜像复制 + XXH64 校验",
+    about = "Camera card copy tool: sy mirror copy plus XXH64 verification",
     long_about = None,
-    after_help = "退出码：0 成功；1 复制或校验失败；2 用法错误；3 预检失败；130 被中断。"
+    after_help = "Exit codes: 0 success; 1 copy or verify failure; 2 usage error; 3 preflight failure; 130 interrupted."
 )]
 pub struct Cli {
-    /// 源目录（存储卡根目录）
+    /// Source directory (card root)
     pub source: PathBuf,
 
-    /// 目标目录（不存在会自动创建）
+    /// Target directory (created when missing)
     pub target: PathBuf,
 
-    /// 目标布局保留源目录名（target/<源目录名>/...）
+    /// Keep the source directory name in the target layout (target/<source name>/...)
     #[arg(long)]
     pub keep_source_name: bool,
 
-    /// 跳过不可读的源文件，而不是预检失败
+    /// Skip unreadable source files instead of failing the preflight
     #[arg(long)]
     pub skip_unreadable: bool,
 
-    /// 目标空间不足时仍然继续
+    /// Continue even when the target looks too small
     #[arg(long)]
     pub force: bool,
 
-    /// 首个失败即中止
+    /// Abort on the first failure
     #[arg(long)]
     pub fail_fast: bool,
 
-    /// 不绘制终端界面，只输出汇总
+    /// Do not draw the progress line, print the summary only
     #[arg(long, conflicts_with = "verbose")]
     pub quiet: bool,
 
-    /// 输出逐文件细节与完整失败清单
+    /// Print per-file detail and the complete failure list
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,
 
-    /// 校验失败时保留目标文件为 .badhash 而不是删除
+    /// Keep mismatching target files as .badhash instead of deleting them
     #[arg(long)]
     pub keep_bad: bool,
 
-    /// 校验时绕过页缓存，使哈希来自设备
+    /// Bypass the page cache while hashing so hashes come from the device
     #[arg(long)]
     pub verify_no_cache: bool,
 
-    /// 开始前清理目标卷上遗留的 .sy-*.tmp 暂存文件
+    /// Remove leftover .sy-*.tmp files from the target before starting
     #[arg(long)]
     pub clean_stale: bool,
 
-    /// 进度行的颜色策略（默认按 NO_COLOR、TERM 与 TTY 判断）
+    /// Number of parallel file transfers passed to sy (sy's -j), 1 means serial
+    #[arg(short = 'j', long, value_name = "N", default_value_t = 1, value_parser = parse_jobs)]
+    pub jobs: usize,
+
+    /// Colour policy for the progress line (defaults to NO_COLOR, TERM and TTY)
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
     pub color: ColorChoice,
+}
+
+/// Reject zero and non-numbers: sy needs at least one transfer slot.
+fn parse_jobs(raw: &str) -> Result<usize, String> {
+    let jobs: usize = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a positive number"))?;
+    if jobs == 0 {
+        return Err("jobs must be at least 1".to_string());
+    }
+    Ok(jobs)
 }
 
 #[cfg(test)]
@@ -80,6 +95,7 @@ mod tests {
     fn cli_parses_defaults() {
         let cli = Cli::try_parse_from(["rcca", "src", "dst"]).unwrap();
         assert_eq!(cli.color, ColorChoice::Auto);
+        assert_eq!(cli.jobs, 1);
         assert!(!cli.keep_source_name);
         assert!(!cli.skip_unreadable);
         assert!(!cli.fail_fast);
@@ -92,6 +108,20 @@ mod tests {
         let cli = Cli::try_parse_from(["rcca", "src", "dst", "--color", "never"]).unwrap();
         assert_eq!(cli.color, ColorChoice::Never);
         assert!(Cli::try_parse_from(["rcca", "src", "dst", "--color", "sometimes"]).is_err());
+    }
+
+    #[test]
+    fn jobs_flag_parses_both_spellings() {
+        let long = Cli::try_parse_from(["rcca", "src", "dst", "--jobs", "8"]).unwrap();
+        assert_eq!(long.jobs, 8);
+        let short = Cli::try_parse_from(["rcca", "src", "dst", "-j", "4"]).unwrap();
+        assert_eq!(short.jobs, 4);
+    }
+
+    #[test]
+    fn jobs_rejects_zero_and_garbage() {
+        assert!(Cli::try_parse_from(["rcca", "src", "dst", "-j", "0"]).is_err());
+        assert!(Cli::try_parse_from(["rcca", "src", "dst", "-j", "many"]).is_err());
     }
 
     #[test]

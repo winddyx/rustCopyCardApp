@@ -1027,8 +1027,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 };
                 pb.inc(bytes_for_progress);
 
-                // rcca 补丁：把已处理的字节数报给宿主。跳过的文件目标是已存在的，
-                // 同样计入"复制这一半已完成"，否则总进度永远到不了 50%。
+                // rcca patch: report the bytes handled to the host. A skipped file already
+                // exists in the target, so it counts as done too; otherwise the overall
+                // progress could never reach 50%.
                 crate::sync::progress::notify_bytes_accounted(match &task.action {
                     SyncAction::Create | SyncAction::Update | SyncAction::Skip => {
                         task.source.as_ref().map(|f| f.size).unwrap_or(0)

@@ -1,7 +1,9 @@
-//! 运行期的一行文字进度：阶段、全程百分比、已完成/总量、当前文件。
+//! The single line of progress drawn while rcca runs: phase, overall percentage,
+//! done/total bytes and the current file.
 //!
-//! 不画进度条，也不显示速度与 ETA。整行原地刷新，写 stderr；stderr 不是 TTY 或
-//! `--quiet` 时完全不绘制，stdout 只保留汇总。
+//! No progress bars, no speed and no ETA. The line is redrawn in place on stderr.
+//! When stderr is not a TTY or `--quiet` is given nothing is drawn at all and
+//! stdout carries the summary only.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -13,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::stats::{Stats, BYTE_UNITS};
 
-/// 阶段标签，两处进度共用同一行的同一个位置。
+/// Phases shown in the label column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Scan,
@@ -47,29 +49,29 @@ impl Phase {
     }
 }
 
-/// 标签列宽：`VERIFY` 最长，其余补空格，文件名列因此不会左右跳。
+/// Label column width: `VERIFY` is the longest, so the file column never moves.
 const LABEL_W: usize = 6;
-/// 百分比列宽，含 `%`。
+/// Percentage column width, `%` included.
 const PCT_W: usize = 4;
-/// 字段之间的固定间隔。
+/// Gap between the fixed columns.
 const GAP: usize = 2;
-/// 文件名至少要留出的列宽，低于它就整段丢掉文件名。
+/// Minimum width left for the file name; below that the name is dropped entirely.
 const MIN_FILE: usize = 8;
 
-/// 绘制风格：是否上色。
+/// How the line is painted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Style {
     pub color: bool,
 }
 
 impl Style {
-    /// 纯文本（测试与管道输出使用）。
+    /// Plain text, used by tests and piped output.
     pub const PLAIN: Self = Self { color: false };
 }
 
 const SGR_DIM: &str = "2";
 
-/// 写入侧：只更新几个数字，绘制由后台线程负责。
+/// Write side: it only updates a few numbers, the ticker thread does the drawing.
 #[derive(Clone)]
 pub struct LiveHandle {
     phase: Arc<AtomicU8>,
@@ -78,30 +80,32 @@ pub struct LiveHandle {
 }
 
 impl LiveHandle {
-    /// 扫描阶段已遍历的文件数。
+    /// Number of files seen so far during the scan phase.
     pub fn set_scanned(&self, files: usize) {
         self.scanned.store(files, Ordering::Relaxed);
     }
 
-    /// 源总字节数；乘二就是全程的分母。扫描结束后调用一次。
+    /// Total source bytes; twice that is the denominator of the whole run. Called
+    /// once the scan is done.
     pub fn set_total(&self, bytes: u64) {
         self.total.store(bytes, Ordering::Relaxed);
     }
 
-    /// 切换阶段；当前文件由 `Stats` 提供，切换后自然更新。
+    /// Switch phase. The current file comes from `Stats`, so it follows on its own.
     pub fn set_phase(&self, phase: Phase) {
         self.phase.store(phase.code(), Ordering::Relaxed);
     }
 }
 
-/// 一行进度的绘制器，运行期间只有它往 stderr 写东西。
+/// Drawing side: while it runs, it is the only writer on stderr.
 pub struct Live {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Live {
-    /// `enabled` 为假（stderr 非 TTY 或 --quiet）时不绘制，也不开线程。
+    /// When `enabled` is false (stderr not a TTY, or --quiet) nothing is drawn and
+    /// no thread is started.
     pub fn start(stats: Arc<Stats>, enabled: bool, style: Style) -> (Self, LiveHandle) {
         let state = LiveHandle {
             phase: Arc::new(AtomicU8::new(Phase::Scan.code())),
@@ -142,7 +146,7 @@ impl Live {
         (Self { stop, handle }, state)
     }
 
-    /// 停止刷新并擦掉这一行，随后才输出汇总。
+    /// Stop refreshing and erase the line before the summary is printed.
     pub fn finish(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -157,7 +161,8 @@ impl Drop for Live {
     }
 }
 
-/// 已经完成的字节数：复制处理的字节加上校验覆盖的字节（每次校验读两侧，除以二）。
+/// Bytes accounted so far: bytes handled by the copy plus bytes covered by
+/// verification (both sides are read, so that count is halved).
 pub fn done_bytes(stats: &Stats) -> u64 {
     stats.copied_bytes.load(Ordering::Relaxed) + stats.hashed_bytes.load(Ordering::Relaxed) / 2
 }
@@ -167,7 +172,7 @@ fn render(state: &LiveHandle, stats: &Stats, width: usize, style: Style) -> Stri
     let label = paint(&pad_label(phase.label()), SGR_DIM, style);
     if phase == Phase::Scan {
         let scanned = state.scanned.load(Ordering::Relaxed);
-        return format!("{label} {} 个文件", scanned);
+        return format!("{label} {scanned} files");
     }
 
     let total = state.total.load(Ordering::Relaxed);
@@ -184,6 +189,8 @@ fn render(state: &LiveHandle, stats: &Stats, width: usize, style: Style) -> Stri
         format!("{label} {pct}{}{bytes}  {shown}", " ".repeat(GAP))
     } else if width >= fixed {
         format!("{label} {pct}{}{bytes}", " ".repeat(GAP))
+            .trim_end()
+            .to_string()
     } else if width >= LABEL_W + 1 + PCT_W {
         format!("{label} {pct}")
     } else {
@@ -191,7 +198,8 @@ fn render(state: &LiveHandle, stats: &Stats, width: usize, style: Style) -> Stri
     }
 }
 
-/// 分子与分母共用分母的单位，位数固定，重绘时不左右跳动。
+/// Numerator and denominator share the denominator's unit, so the digits stay in
+/// place while the line is redrawn.
 fn bytes_columns(done: u64, denom: u64) -> String {
     let index = unit_index(denom);
     let unit = BYTE_UNITS[index];
@@ -200,7 +208,7 @@ fn bytes_columns(done: u64, denom: u64) -> String {
     format!("{num:>width$}/{den} {unit}", width = den.width())
 }
 
-/// 与 `human_bytes` 一致的进位规则，保证单位与汇总里的写法相同。
+/// Same stepping rule as `human_bytes`, so units match the summary.
 fn unit_index(bytes: u64) -> usize {
     let mut value = bytes as f64;
     let mut index = 0;
@@ -227,7 +235,7 @@ fn paint(text: &str, code: &str, style: Style) -> String {
     if !style.color || text.trim().is_empty() {
         return text.to_string();
     }
-    // 尾部空格留在 SGR 之外。
+    // Keep trailing padding outside the SGR span.
     let trimmed = text.trim_end();
     let padding = &text[trimmed.len()..];
     format!("\x1b[{code}m{trimmed}\x1b[0m{padding}")
@@ -280,12 +288,12 @@ fn terminal_width() -> Option<usize> {
     terminal_size::terminal_size().map(|(w, _)| w.0 as usize)
 }
 
-/// 界面是否启用：stderr 是 TTY 且未 --quiet。
+/// Whether the line should be drawn: stderr is a TTY and --quiet was not given.
 pub fn interactive(quiet: bool) -> bool {
     io::stderr().is_terminal() && !quiet
 }
 
-/// 颜色策略：显式开关优先，其次 NO_COLOR、TERM=dumb 与非 TTY。
+/// Colour policy: an explicit switch wins, otherwise NO_COLOR, TERM=dumb and TTY.
 pub fn color_enabled(choice: crate::cli::ColorChoice) -> bool {
     use crate::cli::ColorChoice;
     match choice {
@@ -320,7 +328,7 @@ mod tests {
         let handle = view(Phase::Scan, 0);
         handle.set_scanned(128);
         let line = render(&handle, &Stats::new(), 80, Style::PLAIN);
-        assert_eq!(line, "SCAN   128 个文件");
+        assert_eq!(line, "SCAN   128 files");
     }
 
     #[test]
@@ -331,7 +339,7 @@ mod tests {
         let handle = view(Phase::Copy, 3_000_000_000);
         let line = render(&handle, &stats, 100, Style::PLAIN);
         assert!(line.starts_with("COPY  "), "{line}");
-        assert!(line.contains("50%"), "复制占全程一半：{line}");
+        assert!(line.contains("50%"), "the copy half is 50%: {line}");
         assert!(line.ends_with("A001_06141325_C026.mov"), "{line}");
         assert!(line.width() <= 100, "{line}");
     }
@@ -340,7 +348,7 @@ mod tests {
     fn verify_counts_both_reads_as_one_pass() {
         let stats = Stats::new();
         stats.copied_bytes.store(1000, Ordering::Relaxed);
-        // 校验两侧各读 2000 字节，只计 2000（除以二）。
+        // Both sides read 2000 bytes each; only 2000 counts (halved).
         stats.hashed_bytes.store(4000, Ordering::Relaxed);
         assert_eq!(done_bytes(&stats), 3000);
     }
@@ -372,17 +380,17 @@ mod tests {
         let copy = render(&view(Phase::Copy, 0), &stats, 80, Style::PLAIN);
         let verify = render(&view(Phase::Verify, 0), &stats, 80, Style::PLAIN);
         let column = |line: &str| line[..line.find('x').unwrap()].width();
-        assert_eq!(column(&copy), column(&verify), "文件名列应对齐");
+        assert_eq!(column(&copy), column(&verify), "the file column must align");
         assert!(verify.starts_with("VERIFY"), "{verify}");
     }
 
     #[test]
     fn long_names_keep_their_tail() {
         let stats = Stats::new();
-        stats.set_current("素材目录_第一期_相机A_0001.MOV");
+        stats.set_current("session_01_cameraA_0001.MOV");
         let line = render(&view(Phase::Verify, 1_000_000), &stats, 52, Style::PLAIN);
         assert!(line.width() <= 52, "{line}");
-        assert!(line.ends_with("_0001.MOV"), "保留扩展名：{line}");
+        assert!(line.ends_with("_0001.MOV"), "keep the extension: {line}");
     }
 
     #[test]
@@ -392,7 +400,7 @@ mod tests {
         let handle = view(Phase::Copy, 1_000_000);
         for width in [10usize, 12, 16, 20, 24, 30, 40, 60, 120] {
             let line = render(&handle, &stats, width, Style::PLAIN);
-            assert!(line.width() <= width, "宽度 {width} 时超宽：{line}");
+            assert!(line.width() <= width, "too wide at {width}: {line}");
         }
     }
 
@@ -402,7 +410,7 @@ mod tests {
         stats.set_current("x.mov");
         let handle = view(Phase::Copy, 1_000);
         let plain = render(&handle, &stats, 80, Style::PLAIN);
-        assert!(!plain.contains('\x1b'), "纯文本模式不应带 SGR");
+        assert!(!plain.contains('\x1b'), "plain text must not carry SGR");
 
         let colored = render(&handle, &stats, 80, Style { color: true });
         assert!(colored.starts_with("\x1b[2mCOPY\x1b[0m"), "{colored}");
@@ -411,7 +419,7 @@ mod tests {
 
     #[test]
     fn byte_columns_share_one_unit() {
-        // 分母 11.0 GiB，分子用同一单位，宽度与分母一致，重绘不跳动。
+        // Denominator 11.0 GiB: the numerator uses the same unit and width.
         assert_eq!(
             bytes_columns(0, 11 * 1024 * 1024 * 1024),
             " 0.0/11.0 GiB".to_string()
@@ -424,7 +432,7 @@ mod tests {
 
     #[test]
     fn small_totals_use_their_own_unit() {
-        // 与 human_bytes 同一套进位：1500 字节写作 1.5 KiB。
+        // Same stepping as human_bytes: 1500 bytes is 1.5 KiB.
         assert_eq!(bytes_columns(0, 1500), "0.0/1.5 KiB".to_string());
         assert_eq!(bytes_columns(0, 900), "  0/900 B".to_string());
     }

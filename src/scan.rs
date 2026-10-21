@@ -1,4 +1,5 @@
-//! 阶段 1 与阶段 3 的遍历：构建清单、检查目标、判定源在复制期间是否变化。
+//! Traversal for the preflight and for the post-copy stability check: build the
+//! manifest, check path rules and detect sources that change during the copy.
 
 use std::fs;
 use std::io;
@@ -7,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::paths::{looks_like_tmp, path_problems, windows_name_problems, RelPath};
 
-/// mtime 容差：exFAT 为 10 ms、FAT 为 2 s，此处统一取 2 s。
+/// mtime tolerance: exFAT is 10 ms, FAT is 2 s, so 2 s covers both.
 pub const MTIME_TOLERANCE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
@@ -23,9 +24,9 @@ pub struct Manifest {
     pub total_bytes: u64,
     pub skipped_symlinks: usize,
     pub skipped_special: usize,
-    /// 遍历过程中无法读取的目录或文件。
+    /// Directories or files that could not be read while traversing.
     pub errors: Vec<String>,
-    /// 路径规则冲突：tmp 命名冲突、路径超长、Windows 非法名。
+    /// Path rule conflicts: temp name collision, over-long path, illegal Windows name.
     pub conflicts: Vec<String>,
 }
 
@@ -44,18 +45,20 @@ pub enum SourceIssue {
 impl SourceIssue {
     pub fn describe(&self) -> String {
         match self {
-            SourceIssue::Vanished => "源文件已消失".to_string(),
-            SourceIssue::Changed(d) => format!("源文件在复制期间发生变化（{d}）"),
+            SourceIssue::Vanished => "source file disappeared".to_string(),
+            SourceIssue::Changed(d) => {
+                format!("source file changed during the copy ({d})")
+            }
         }
     }
 }
 
-/// 阶段 1：递归遍历源目录，构建清单并做路径规则检查。
+/// Walk the source tree, build the manifest and check path rules.
 pub fn scan(root: &Path, target_root: &Path) -> io::Result<Manifest> {
     scan_with_progress(root, target_root, &mut |_| {})
 }
 
-/// 同上，但每 256 个条目回调一次已扫描文件数，用于界面显示进度。
+/// Same as `scan`, but reports the number of scanned files every 256 entries.
 pub fn scan_with_progress(
     root: &Path,
     target_root: &Path,
@@ -76,7 +79,7 @@ pub fn scan_with_progress(
             Err(err) => {
                 manifest
                     .errors
-                    .push(format!("无法读取目录 {}：{err}", abs.display()));
+                    .push(format!("cannot read directory {}: {err}", abs.display()));
                 continue;
             }
         };
@@ -85,9 +88,10 @@ pub fn scan_with_progress(
         for item in read {
             match item {
                 Ok(entry) => items.push(entry),
-                Err(err) => manifest
-                    .errors
-                    .push(format!("目录项读取失败 {}：{err}", abs.display())),
+                Err(err) => manifest.errors.push(format!(
+                    "cannot read directory entry {}: {err}",
+                    abs.display()
+                )),
             }
         }
         items.sort_by_key(|e| e.file_name());
@@ -98,9 +102,10 @@ pub fn scan_with_progress(
             let meta = match fs::symlink_metadata(item.path()) {
                 Ok(m) => m,
                 Err(err) => {
-                    manifest
-                        .errors
-                        .push(format!("无法获取元数据 {}：{err}", item.path().display()));
+                    manifest.errors.push(format!(
+                        "cannot read metadata {}: {err}",
+                        item.path().display()
+                    ));
                     continue;
                 }
             };
@@ -124,7 +129,7 @@ pub fn scan_with_progress(
             }
             if looks_like_tmp(&name) {
                 manifest.conflicts.push(format!(
-                    "源文件名与暂存文件规则冲突（形如 {}{}{}）：{}",
+                    "source file name collides with the temp file rule ({}{}{}): {}",
                     crate::paths::TMP_PREFIX,
                     "xxxxxxxx",
                     crate::paths::TMP_SUFFIX,
@@ -151,13 +156,13 @@ pub fn scan_with_progress(
         }
     }
 
-    // 文件按路径排序，保证多次运行顺序一致。
+    // Keep files sorted by path so repeated runs behave the same.
     manifest.files.sort_by(|a, b| a.rel.cmp(&b.rel));
     progress(manifest.files.len());
     Ok(manifest)
 }
 
-/// 逐个源文件试探可读性。返回不可读清单。
+/// Probe every source file for readability. Returns the unreadable ones.
 pub fn probe_readable(root: &Path, files: &[Entry]) -> Vec<(RelPath, String)> {
     let mut bad = Vec::new();
     for entry in files {
@@ -168,7 +173,7 @@ pub fn probe_readable(root: &Path, files: &[Entry]) -> Vec<(RelPath, String)> {
     bad
 }
 
-/// 阶段 3：复查每个源文件是否与阶段 1 清单一致。
+/// Re-check every source file against the manifest recorded before the copy.
 pub fn check_stability(root: &Path, files: &[Entry]) -> Vec<Option<SourceIssue>> {
     files
         .iter()
@@ -180,20 +185,22 @@ pub fn check_stability(root: &Path, files: &[Entry]) -> Vec<Option<SourceIssue>>
                     return if err.kind() == io::ErrorKind::NotFound {
                         Some(SourceIssue::Vanished)
                     } else {
-                        Some(SourceIssue::Changed(format!("元数据读取失败：{err}")))
+                        Some(SourceIssue::Changed(format!("cannot read metadata: {err}")))
                     };
                 }
             };
             if meta.len() != entry.size {
                 return Some(SourceIssue::Changed(format!(
-                    "大小 {} 变为 {}",
+                    "size changed from {} to {}",
                     entry.size,
                     meta.len()
                 )));
             }
             let now_mtime = meta.modified().ok();
             if mtime_changed(entry.mtime, now_mtime) {
-                return Some(SourceIssue::Changed("修改时间变化".to_string()));
+                return Some(SourceIssue::Changed(
+                    "modification time changed".to_string(),
+                ));
             }
             None
         })
@@ -210,7 +217,7 @@ fn mtime_changed(before: Option<SystemTime>, after: Option<SystemTime>) -> bool 
             delta > MTIME_TOLERANCE
         }
         (None, None) => false,
-        // 一侧拿不到时间时不做判定，避免误报。
+        // With only one side known there is nothing to compare; do not report a change.
         _ => false,
     }
 }

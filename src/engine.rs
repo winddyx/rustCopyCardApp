@@ -1,7 +1,8 @@
-//! 复制阶段：调用内嵌的 sy 引擎（vendor/sy，上游 nijaru/sy v0.4.1）。
+//! Copy phase: drive the embedded sy engine (vendor/sy, upstream nijaru/sy v0.4.1).
 //!
-//! rcca 只负责参数映射与路径语义：源目录按“复制内容”传递（等价于上游
-//! `sy <source>/ <target> --delete`），遍历与校验仍由 rcca 自己做。
+//! rcca only maps options and path semantics: the source directory is passed by
+//! content (equivalent to `sy <source>/ <target> --delete`); traversal and
+//! verification stay inside rcca.
 
 use std::path::Path;
 
@@ -10,39 +11,36 @@ use sy::transport::local::LocalTransport;
 
 use crate::error::{Error, Result};
 
-/// 内嵌 sy 的上游版本。
+/// Upstream sy version embedded here.
 pub const VERSION: &str = "v0.4.1";
 
-/// 删除保护阈值（百分比），与上游 `--max-delete 50%` 的默认值一致。
+/// Delete guard threshold in percent, same as upstream `--max-delete 50%`.
 const DELETE_THRESHOLD: u8 = 50;
-
-/// 串行复制：一次只搬一个文件（对应上游 `-j 1`）。
-///
-/// 显示上一行只有"当前文件"，串行才不会在多个并发文件之间跳；对 U 盘、机械盘
-/// 这类存储，顺序读通常不比并发随机差。
-const PARALLEL_TRANSFERS: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// 删除目标中源里不存在的文件（镜像语义）。
+    /// Delete files in the target that no longer exist in the source (mirror semantics).
     pub delete: bool,
-    /// 出错上限，用于实现 --fail-fast。
+    /// Number of parallel transfers handed to sy (its `-j`); 1 means serial.
+    pub jobs: usize,
+    /// Error limit, used to implement --fail-fast.
     pub max_errors: Option<usize>,
 }
 
 impl Options {
-    /// 默认镜像参数：保留删除镜像语义，其余按上游默认。
+    /// Default mirror options: keep the delete semantics, everything else upstream default.
     pub fn mirror() -> Self {
         Self {
             delete: true,
+            jobs: 1,
             max_errors: None,
         }
     }
 }
 
-/// 注册"某个文件开始复制"的回调，界面用它显示当前文件。
+/// Register a callback fired when a file starts copying; the interface shows its name.
 ///
-/// sy 自身不打印任何进度：复制阶段的可见输出全部由 rcca 负责。
+/// sy prints no progress of its own: everything visible during the copy is drawn by rcca.
 pub fn set_file_observer<F>(observer: F)
 where
     F: Fn(&Path) + Send + Sync + 'static,
@@ -50,7 +48,8 @@ where
     sy::sync::progress::set_file_observer(Box::new(observer));
 }
 
-/// 注册"某个任务已处理完多少字节"的回调，界面用它算全程进度。
+/// Register a callback fired with the byte count of every finished task, used for
+/// the overall progress figure.
 pub fn set_bytes_observer<F>(observer: F)
 where
     F: Fn(u64) + Send + Sync + 'static,
@@ -58,13 +57,14 @@ where
     sy::sync::progress::set_bytes_observer(Box::new(observer));
 }
 
-/// 把源目录内容同步到目标目录，返回 sy 的统计。
+/// Mirror the source directory into the target and return sy's counters.
 pub fn copy_tree(source: &Path, target: &Path, opts: &Options) -> Result<SyncStats> {
     let mut config = SyncConfig::test_default();
-    // sy 只负责搬数据：进度条、扫描提示与逐文件进度全部关闭，界面对外由 rcca 绘制。
+    // sy only moves bytes here: bars, planning messages and per-file progress are off,
+    // the interface is drawn entirely by rcca.
     config.quiet = true;
     config.progress = false;
-    config.max_concurrent = PARALLEL_TRANSFERS;
+    config.max_concurrent = opts.jobs.max(1);
     config.delete = if opts.delete {
         DeleteMode::Enabled {
             threshold: DELETE_THRESHOLD,
@@ -81,12 +81,12 @@ pub fn copy_tree(source: &Path, target: &Path, opts: &Options) -> Result<SyncSta
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|err| Error::copy(format!("无法创建异步运行时：{err}")))?;
+        .map_err(|err| Error::copy(format!("cannot create the async runtime: {err}")))?;
 
     let engine = SyncEngine::with_config(LocalTransport::new(), config);
     runtime
         .block_on(engine.sync(source, target))
-        .map_err(|err| Error::copy(format!("sy：{err}")))
+        .map_err(|err| Error::copy(format!("sy: {err}")))
 }
 
 #[cfg(test)]
@@ -97,6 +97,7 @@ mod tests {
     fn mirror_options_enable_delete() {
         let opts = Options::mirror();
         assert!(opts.delete);
+        assert_eq!(opts.jobs, 1);
         assert!(opts.max_errors.is_none());
     }
 
@@ -119,7 +120,7 @@ mod tests {
         copy_tree(src.path(), dst.path(), &Options::mirror()).unwrap();
         assert!(
             seen.load(Ordering::Relaxed) >= 2,
-            "每个文件都应通知一次：{}",
+            "every file should be reported: {}",
             seen.load(Ordering::Relaxed)
         );
     }
@@ -135,7 +136,7 @@ mod tests {
 
         let stats = copy_tree(src.path(), dst.path(), &Options::mirror()).unwrap();
 
-        // 源目录的内容落在目标根目录下，而不是再套一层源目录名。
+        // The contents of the source land in the target root, not one level deeper.
         assert_eq!(
             std::fs::read(dst.path().join("a/b/clip.MP4")).unwrap(),
             b"payload"
@@ -158,13 +159,16 @@ mod tests {
 
         let stats = copy_tree(src.path(), dst.path(), &Options::mirror()).unwrap();
 
-        assert!(!dst.path().join("stale.txt").exists(), "多余文件应被删除");
+        assert!(
+            !dst.path().join("stale.txt").exists(),
+            "extra files must be deleted"
+        );
         assert_eq!(stats.files_deleted, 1);
     }
 
     #[test]
     fn deletion_threshold_stays_at_upstream_default() {
-        // 上游默认 --max-delete 50%：目标里几乎全是多余文件时会拒绝删除。
+        // Upstream defaults to --max-delete 50%: refuse when almost everything would go.
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(dst.path().join("stale.txt"), b"old").unwrap();
@@ -173,8 +177,11 @@ mod tests {
         let message = format!("{err}");
         assert!(
             message.contains("Deletion threshold"),
-            "应保留 sy 的删除保护：{message}"
+            "sy's delete guard should stay in place: {message}"
         );
-        assert!(dst.path().join("stale.txt").exists(), "被拒绝时不应删除");
+        assert!(
+            dst.path().join("stale.txt").exists(),
+            "nothing may be deleted when the guard refuses"
+        );
     }
 }
