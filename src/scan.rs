@@ -41,8 +41,11 @@ pub struct Manifest {
     pub total_bytes: u64,
     // 被跳过的符号链接数：sy 会复制它们，但 rcca 无法校验。
     pub skipped_symlinks: usize,
-    // 被跳过的特殊文件数（管道、套接字、设备节点）。
+    // 特殊文件数（管道、套接字、设备节点）。sy 只认常规文件与符号链接，
+    // 这类条目交给它会阻塞或失败，因此 preflight 直接拒绝，这里只用于给出原因。
     pub skipped_special: usize,
+    /// 第一个特殊文件的相对路径，供错误信息指路。
+    pub first_special: Option<RelPath>,
     /// 遍历过程中读不到的目录或文件。
     pub errors: Vec<String>,
     /// 路径规则冲突：临时文件名撞车、路径过长、非法 Windows 文件名。
@@ -224,8 +227,12 @@ pub fn scan_with_progress(
                     mtime: meta.modified().ok(),
                 });
             } else {
-                // 剩下的都是特殊文件：管道、套接字、设备节点等，无法按普通文件复制。
+                // 剩下的都是特殊文件：管道、套接字、设备节点等。sy 会把它们当作常规文件
+                // 去读（管道会永久阻塞、设备可能读不完），因此记下第一个路径供 preflight 报错。
                 manifest.skipped_special += 1;
+                if manifest.first_special.is_none() {
+                    manifest.first_special = Some(rel);
+                }
             }
         }
     }
@@ -375,6 +382,31 @@ mod tests {
         // 链接被计入跳过，而不是静默消失。
         #[cfg(unix)]
         assert_eq!(manifest.skipped_symlinks, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_records_the_first_special_file() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let src = tmpdir();
+        let dst = tmpdir();
+        fs::write(src.path().join("real.txt"), b"x").unwrap();
+        // 管道节点：`is_file()` 为假且不是链接，因此归入特殊文件。
+        let fifo = src.path().join("pipe.fifo");
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+
+        let manifest = scan(src.path(), dst.path()).unwrap();
+        assert_eq!(manifest.skipped_special, 1);
+        // 记录第一个路径，preflight 才能指出该删哪个文件。
+        assert_eq!(
+            manifest.first_special.as_ref().map(|rel| rel.display()),
+            Some("pipe.fifo".to_string())
+        );
+        // 常规文件照旧进入清单。
+        assert_eq!(manifest.files.len(), 1);
     }
 
     #[test]

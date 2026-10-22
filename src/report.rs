@@ -215,11 +215,14 @@ fn result_line(summary: &Summary) -> String {
     }
     // 只有一个问题时不加复数 s。
     let suffix = if summary.failure_count == 1 { "" } else { "s" };
+    // 样例全部被丢弃时（单条信息超过字节预算）不能承诺"列在下面"，否则只有一个空列表。
+    let tail = if summary.failures.is_empty() {
+        ""
+    } else {
+        ", listed below"
+    };
     // `{suffix}` 直接把变量插进句子，`{}` 则是显式的第一个位置参数。
-    format!(
-        "! Failed: {} problem{suffix}, listed below",
-        summary.failure_count
-    )
+    format!("! Failed: {} problem{suffix}{tail}", summary.failure_count)
 }
 
 // 测试模块只在 `cargo test` 时编译。
@@ -426,5 +429,20 @@ mod tests {
             .find(|l| l.trim_start().starts_with('✓'))
             .expect("result line");
         assert!(result.contains("All files copied and verified"), "{result}");
+    }
+
+    #[test]
+    fn a_failure_without_kept_examples_does_not_promise_a_list() {
+        let mut summary = base();
+        // 计数存在但样例全被丢弃（单条信息超过字节预算）：不能写"列在下面"。
+        summary.failure_count = 3;
+        let lines = render(&summary);
+        let result = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with('!'))
+            .expect("result line");
+        assert_eq!(result, "  ! Failed: 3 problems");
+        // 结果行之后不应再出现空的失败列表。
+        assert_eq!(lines.last().unwrap(), result, "{lines:?}");
     }
 }

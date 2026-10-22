@@ -251,10 +251,14 @@ fn render(state: &LiveHandle, stats: &Stats, width: usize, style: Style) -> Stri
     let denom = total.saturating_mul(2);
     // 完成的字节不能超过分母，否则百分比会出现大于 100 的怪值。
     let done = done_bytes(stats).min(denom);
-    // `checked_div` 在分母为 0 时返回 `None`，此时按 100% 处理（清单为空即视为完成）。
-    let percent = done.saturating_mul(100).checked_div(denom).unwrap_or(100) as u32;
-    // `{:>3}` 表示右对齐、最少三位，这样 5% 和 95% 的百分号仍然对齐。
-    let pct = format!("{percent:>3}%");
+    // 分母为 0（源里全是 0 字节文件）时百分比没有定义，用短横线占住这一列，
+    // 既不谎报 100%，也不会让后面的列左右跳动。
+    let pct = match done.saturating_mul(100).checked_div(denom) {
+        // `{:>3}` 表示右对齐、最少三位，这样 5% 和 95% 的百分号仍然对齐。
+        Some(percent) => format!("{percent:>3}%"),
+        // 宽度与 `{:>3}%` 一致（3 位数字 + `%`）。
+        None => format!("{:>PCT_W$}", "-"),
+    };
     // 字节列自己决定单位与宽度，保证分子分母同一单位。
     let bytes = bytes_columns(done, denom);
     // 当前文件名从 `Stats` 读取（那里是跨线程共享的）。
@@ -516,6 +520,17 @@ mod tests {
         let handle = view(Phase::Verify, 5_000);
         let line = render(&handle, &stats, 80, Style::PLAIN);
         assert!(line.contains("100%"), "{line}");
+    }
+
+    #[test]
+    fn a_zero_byte_total_shows_no_percentage() {
+        // 源里全是 0 字节文件时分母为 0：百分比没有定义，不能报 100%。
+        let stats = Stats::new();
+        stats.set_current("empty.bin");
+        let line = render(&view(Phase::Copy, 0), &stats, 80, Style::PLAIN);
+        assert!(!line.contains('%'), "no percentage without bytes: {line}");
+        // 短横线占的宽度与 `100%` 相同（4 列），固定列因此不会挪位。
+        assert_eq!(line, "COPY      -  0/0 B  empty.bin");
     }
 
     #[test]

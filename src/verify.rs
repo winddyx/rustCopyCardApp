@@ -173,7 +173,8 @@ pub fn run(
     let jobs = opts.jobs.max(1).min(files.len().max(1));
     // 结果按清单下标存放，`None` 表示该位置还没被处理。用 `Mutex` 保护整个向量，
     // 因为多个线程会写不同位置，凭"下标不同"推理安全性对编译器来说不够。
-    let outcomes: Mutex<Vec<Option<Outcome>>> =
+    // 每个槽位是"结果 + 该文件是否真的被读过"的字节数，后者用于 `checked_bytes`。
+    let outcomes: Mutex<Vec<Option<(Outcome, u64)>>> =
         Mutex::new((0..files.len()).map(|_| None).collect());
     // 共享的任务游标：每个线程用 `fetch_add` 原子地领取下一个下标，天然实现负载均衡。
     let cursor = std::sync::atomic::AtomicUsize::new(0);
@@ -213,18 +214,15 @@ pub fn run(
 
     // 汇总成对外报告。
     let mut report = VerifyReport::default();
-    // `into_inner` 消费 `Mutex` 取出向量；锁曾中毒时返回 `Err`，用 `unwrap_or_default` 兜底。
-    let collected = outcomes.into_inner().unwrap_or_default();
-    // `enumerate` 同时给出下标和值，下标用于对齐 `files` 里的条目。
-    for (pos, outcome) in collected.into_iter().enumerate() {
-        // 未被处理的位置（中断时会出现）直接跳过，也就不会计入 `checked_bytes`。
-        let Some(outcome) = outcome else {
-            continue;
-        };
-        // 被检查过的文件无论结果如何都计入字节数。
-        if let Some(entry) = files.get(pos) {
-            report.checked_bytes += entry.size;
-        }
+    // `into_inner` 消费 `Mutex` 取出向量。`thread::scope` 会把工作线程的 panic 重新抛出，
+    // 因此走到这里时锁不会中毒；`Err` 分支只是防备，取回内部数据继续汇总，不丢结果。
+    let collected = outcomes
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for slot in collected.into_iter().flatten() {
+        // 槽位里带着"该文件是否真的被读过"的字节数：只有读过才计入 `checked_bytes`。
+        let (outcome, checked_bytes) = slot;
+        report.checked_bytes += checked_bytes;
         // 四种结果分别累加到不同字段，报告因此能分开说明问题性质。
         match outcome {
             Outcome::Matched => report.matched += 1,
@@ -237,7 +235,11 @@ pub fn run(
     report
 }
 
-/// 校验单个文件。所有失败都以 `Outcome` 返回，不向外抛错误，
+/// 校验单个文件，返回结果以及"该文件是否真的被读过"的字节数。
+///
+/// 第二个返回值用于汇总里的 `checked_bytes`：目标缺失、源文件在扫描后变动、
+/// 目标无法检查等情况下一个字节都没读，不能计入"已检查字节"。
+/// 所有失败都以 `Outcome` 返回，不向外抛错误，
 /// 这样一次运行可以汇报全部问题而不是在第一个问题上中断。
 fn verify_one(
     // 清单条目：相对路径、预期大小与修改时间。
@@ -248,7 +250,7 @@ fn verify_one(
     stats: &Stats,
     // 复用的读缓冲区。
     buffer: &mut [u8],
-) -> Outcome {
+) -> (Outcome, u64) {
     // 相对路径的显示形式，用于拼错误信息。
     let rel = entry.rel.display();
     // 进度行只显示文件名，不显示完整路径。
@@ -262,21 +264,31 @@ fn verify_one(
     match fs::metadata(&dst) {
         // 元数据可读：继续后面的校验。
         Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Outcome::Missing(rel),
-        Err(err) => return Outcome::Failed(format!("{rel}: cannot inspect target: {err}")),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return (Outcome::Missing(rel), 0),
+        Err(err) => {
+            return (
+                Outcome::Failed(format!("{rel}: cannot inspect target: {err}")),
+                0,
+            )
+        }
     }
 
     // 源文件在扫描之后又变动过，就没有可比较的基准；此时按哈希结果行事可能
     // 删掉唯一一份好数据，所以先拒绝处理。
     if let Some(issue) = stability_issue(source, entry) {
-        return Outcome::Failed(format!("{rel}: {}", issue.describe()));
+        return (Outcome::Failed(format!("{rel}: {}", issue.describe())), 0);
     }
 
     // 读源并哈希，读到的字节数会累加到统计里。
     let src_hash = hash_counted(&src, buffer, opts, stats);
+    // 源读成功说明这个文件确实参与了校验：计入"已检查字节"（两侧都读，只算一次大小）。
+    let checked_bytes = if src_hash.is_ok() { entry.size } else { 0 };
     // 读完源之后、读目标之前再核对一次，覆盖"哈希期间源被改写"的情况。
     if let Some(issue) = stability_issue(source, entry) {
-        return Outcome::Failed(format!("{rel}: {}", issue.describe()));
+        return (
+            Outcome::Failed(format!("{rel}: {}", issue.describe())),
+            checked_bytes,
+        );
     }
     // 再读目标并哈希。
     let dst_hash = hash_counted(&dst, buffer, opts, stats);
@@ -313,8 +325,8 @@ fn verify_one(
         (Err(err), _) | (_, Err(err)) => Outcome::Failed(format!("{rel}: read failed: {err}")),
     };
 
-    // 直接作为函数返回值。
-    outcome
+    // 结果与"是否真的读过"一起返回，调用方据此累计 `checked_bytes`。
+    (outcome, checked_bytes)
 }
 
 /// 把单个条目与复制前记录的清单比较。
@@ -534,8 +546,26 @@ mod tests {
         );
         assert_eq!(report.matched, 3);
         assert_eq!(report.mismatched.len(), 1);
-        // 四个文件各 4 字节：失败的那一个也算被检查过。
+        // 四个文件各 4 字节：失败的那一个也被读过，同样计入。
         assert_eq!(report.checked_bytes, 16);
+    }
+
+    #[test]
+    fn a_missing_target_adds_no_checked_bytes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.bin"), b"abc").unwrap();
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let report = run(
+            &manifest.files,
+            src.path(),
+            dst.path(),
+            &base_options(),
+            &Stats::new(),
+        );
+        assert_eq!(report.missing.len(), 1);
+        // 目标不存在时一个字节都没读，"已检查字节"必须为 0。
+        assert_eq!(report.checked_bytes, 0);
     }
 
     #[test]

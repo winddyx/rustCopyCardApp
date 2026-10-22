@@ -32,8 +32,10 @@ The remaining change is about copy progress, not compilation:
    `src/sync/mod.rs` computes both figures from the finished task: the size of every
    completed create, update or skip, plus a flag that is true only when the task moved
    one regular file. A failed task reports `(0, false)`, so neither the progress figure
-   nor the transfer count claims work that did not happen, and directories never count
-   as transferred files.
+   nor the transfer count claims work that did not happen; directories and symlinks never
+   count as transferred files (rcca cannot hash symlinks, so counting them would make the
+   transfer figure disagree with the verified figure in the same summary). Their size
+   still counts towards progress.
    Upstream has no per-file callback at all, so a host can only guess progress from the
    bars. With these two callbacks rcca turns off every sy progress output
    (`quiet=true`, `progress=false`) and draws one line with phase, percentage, bytes and

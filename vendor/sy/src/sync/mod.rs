@@ -1023,10 +1023,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 // the target, so it counts as done too; otherwise the overall progress
                 // could never reach 50%. A failed task counts for neither, it moved
                 // nothing and does not belong in the transfer count.
+                //
+                // Symlinks are excluded from the transfer count: rcca cannot hash them, so
+                // counting them would make "N files transferred" disagree with "N files
+                // verified" in the same summary. Their size still counts for progress.
                 let (bytes_for_progress, transferred_file) = match (&task.action, result.is_ok()) {
                     (SyncAction::Create | SyncAction::Update, true) => (
                         task.source.as_ref().map(|f| f.size).unwrap_or(0),
-                        task.source.as_ref().map(|f| !f.is_dir).unwrap_or(false),
+                        task.source
+                            .as_ref()
+                            .map(|f| !f.is_dir && !f.is_symlink)
+                            .unwrap_or(false),
                     ),
                     (SyncAction::Skip, true) => {
                         (task.source.as_ref().map(|f| f.size).unwrap_or(0), false)

@@ -322,6 +322,90 @@ fn symlinks_are_copied_but_not_verified() {
         stdout.contains("1/1 passed"),
         "symlinks are not verified: {stdout}"
     );
+    // Transfer 只算常规文件：符号链接不属于可校验的传输，计入就会与 Verify 行矛盾。
+    assert!(
+        stdout.contains("  Transfer   1 file · 4 B"),
+        "a symlink is not a transferred file: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_only_source_is_copied_and_never_verified() {
+    // 源里没有常规文件：清单为空，但 sy 仍要复制符号链接。
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "real.bin", b"data");
+    std::os::unix::fs::symlink("real.bin", src.path().join("link.bin")).unwrap();
+    // 目标里的真实文件不存在时链接是悬空的，但仍应作为链接原样复制。
+    fs::remove_file(src.path().join("real.bin")).unwrap();
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        fs::symlink_metadata(dst.path().join("link.bin"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink must actually be copied: {stdout}"
+    );
+    assert!(
+        stdout.contains("  Verify     0 files"),
+        "nothing can be verified without regular files: {stdout}"
+    );
+    // 提示语必须与实际行为一致：这一条只有在 sy 真的执行过之后才成立。
+    assert!(
+        stderr.contains("1 symlink is copied but not verified"),
+        "the note follows the copy: {stderr}"
+    );
+}
+
+#[test]
+fn an_empty_source_still_runs_the_mirror() {
+    // 空源目录意味着目标里的文件都该删除，这超过 50% 的保护阈值，sy 因此拒绝。
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(dst.path(), "stale.bin", b"old");
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an empty source is not a silent no-op: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dst.path().join("stale.bin").exists(),
+        "the guard leaves the target untouched"
+    );
+}
+
+#[test]
+fn an_empty_source_into_an_empty_target_succeeds() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  Verify     0 files"), "{stdout}");
+    assert!(stdout.contains("All files copied and verified"), "{stdout}");
+}
+
+#[test]
+fn empty_directories_are_created_in_the_target() {
+    // 没有常规文件的源也要建立目录结构：这条路径以前会整段跳过。
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    fs::create_dir_all(src.path().join("100MEDIA/EMPTY")).unwrap();
+
+    rcca().arg(src.path()).arg(dst.path()).assert().success();
+    assert!(
+        dst.path().join("100MEDIA/EMPTY").is_dir(),
+        "directories are part of the mirror"
+    );
 }
 
 #[test]

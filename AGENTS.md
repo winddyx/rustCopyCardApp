@@ -10,7 +10,7 @@
   repository; its `main` carries this line of work (`git push fork main`). Upstream
   nijaru/sy is never touched (no PRs, no issues, no feature requests).
 - Behaviour changes bump `Cargo.toml` and add `git tag -a vX.Y.Z`; tags so far are
-  `v2.1.0` … `v2.9.0`.
+  `v2.1.0` … `v2.10.0`.
 - License: MIT (`LICENSE`, Copyright (c) 2026 winddyx). `vendor/sy` keeps its own MIT
   license and copyright at `vendor/sy/LICENSE`; both notices must stay.
 
@@ -22,11 +22,22 @@
 - The source is passed by content (`<source>/`): the target receives the contents of the
   source directory, not an extra level named after it.
 - Mirror semantics are fixed: `--delete` plus sy's default `max_delete 50%` guard. No
-  switch exposes anything else.
+  switch exposes anything else. sy runs on every invocation, including a source with no
+  regular files: an empty source still has to delete the target's extra files (and is
+  refused by the guard when that exceeds 50%), a symlink-only source still has to copy
+  the links, and a tree of empty directories still has to be created. Never short-circuit
+  the copy because the manifest is empty.
 - rcca owns the preflight (path nesting, writable target, free space, 4 GiB cap on FAT,
-  unreadable sources), the manifest from `src/scan.rs`, XXH64 verification in
-  `src/verify.rs`, the single progress line in `src/ui.rs`, the summary in
+  unreadable sources, special files), the manifest from `src/scan.rs`, XXH64 verification
+  in `src/verify.rs`, the single progress line in `src/ui.rs`, the summary in
   `src/report.rs` and the exit codes.
+- The target is resolved without creating it (`resolve_target`), so a layout that is
+  rejected with exit 2 never leaves a directory behind. It is created only after the
+  nesting check, then canonicalised and checked once more.
+- Special files (fifo, socket, device) are a preflight failure with exit 3, naming the
+  first one. sy handles only regular files and symlinks: it would read a fifo as a normal
+  file and block on it forever, and a socket fails with ENOTSUP. Do not turn this back
+  into a note — the old note promised "not copied" while sy still attempted the copy.
 
 ## vendor/sy
 
@@ -34,7 +45,8 @@
   `vendor/sy/PATCHES.md`: three Windows compile fixes (`Win32_Foundation` in
   `windows-sys`, `dest_path` in `ssh.rs`, `symlink_file`/`symlink_dir`) and one callback
   patch (`set_file_observer` / `set_bytes_observer`, wired in `transfer.rs` and
-  `mod.rs`) that lets rcca draw its own progress.
+  `mod.rs`) that lets rcca draw its own progress. The callback's `transferred_file` flag
+  is true only for a regular file, so symlinks never reach the `Transfer` count.
 - Any vendor change updates `PATCHES.md` in the same commit. Upgrade steps live there.
 
 ## Commands
@@ -56,7 +68,7 @@
   target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
   armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
   the recipe creates under `target/armv7-support`.
-- `make test` (`cargo test`): 53 unit tests in `src/`, 24 integration tests in `tests/`
+- `make test` (`cargo test`): 58 unit tests in `src/`, 33 integration tests in `tests/`
   (`cli_flow.rs`, `failure_paths.rs`).
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
 
@@ -67,11 +79,22 @@
   during verification.
 - Ctrl-C during the copy is not intercepted (the default signal handling ends the
   process and may leave `.sy-xxxxxxxx.tmp`, cleaned by `--clean-stale`). Only the
-  verification phase installs a handler.
+  verification phase installs a handler: the first signal asks for a graceful stop
+  (finish the current file, print the summary, exit 130), a second one exits immediately
+  with 130 without printing the summary. Verification only checks the flag between
+  files, so the second signal is the way out of a long single-file hash.
+- Per-file copy errors are not capped unless `--fail-fast` is given: `engine::Options`
+  maps `None` to sy's `0` ("unlimited"), which must be assigned explicitly because sy's
+  `SyncConfig::test_default()` carries `max_errors: 100`. A capped run aborts mid-copy
+  and prints only `rcca: copy failed: sy: …`, without a summary.
 - When more than 50% of the target files would be deleted, sy refuses, the run exits 1
   and the target stays untouched. That upstream guard is intentional.
 - Verification deletes a mismatching target file by default; `--keep-bad` quarantines it
   as `.<name>.badhash`. A final file name therefore means "verified".
+- `--skip-unreadable` filters rcca's manifest only; sy still scans and attempts those
+  files, so its error for the same destination is dropped (the preflight note stands)
+  and one unreadable file counts as exactly one problem. A file removed this way is not
+  verified, so "a final name means verified" has this one exception.
 
 ## Terminal output (easiest place to break things)
 
@@ -80,6 +103,8 @@
 - Percentage denominator is twice the total source bytes: copy fills the first half,
   verification the second. The copy numerator counts every finished file including
   skipped ones; the verify numerator is bytes read, halved because both sides are read.
+  When the denominator is 0 (every source file is empty) the percentage column shows
+  `-`, because a byte-based percentage is undefined there.
 - Labels `SCAN` / `COPY` / `VERIFY` are padded to 6 columns, the file name starts at
   column 8, over-long names are truncated from the start so the extension survives.
 - stdout carries the summary only, so `rcca source target > log` is clean text. Without a
@@ -88,8 +113,14 @@
   length of the example list: the store is bounded (32 examples, 64 KiB), the count is
   not. `--verbose` raises both bounds so its list is complete. Failure text is flattened
   to one line before printing, sy wraps its errors.
-- Symlinks and special files are counted in `Manifest::skipped_symlinks` /
-  `skipped_special` and reported as a stderr note, never silently dropped.
+- The summary's `Transfer` row counts regular files only and pairs them with sy's
+  `bytes_transferred`; the `Verify` row's byte figure covers only the files whose source
+  side was actually hashed (`checked_bytes`), so a missing target contributes 0.
+- Symlinks are counted in `Manifest::skipped_symlinks` and reported as a stderr note,
+  never silently dropped. A source that holds only symlinks has an empty manifest but is
+  still copied (the note is accurate only because sy runs regardless of the manifest).
+  Special files never reach the copy: they fail the preflight (`skipped_special` and
+  `first_special` only build that message).
 - `-j/--jobs` (default 1) applies to both phases: sy's `max_concurrent` for the copy, a
   `std::thread::scope` pool with one buffer per worker for verification. Verification
   collects one outcome per file and reports in manifest order, so results never depend on

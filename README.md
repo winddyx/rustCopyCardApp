@@ -64,6 +64,12 @@ deleted (equivalent to `sy <source>/ <target> --delete`). As upstream does by de
 sy refuses when more than 50% of the target files would be deleted; the run then exits
 with code 1 and the target stays untouched.
 
+The mirror runs on every invocation, including a source that holds no regular files: an
+empty source directory deletes the target's extra files (and is refused by the guard when
+that exceeds 50%), a source with only symlinks copies those links, and a tree of empty
+directories is created on the target. Such a run verifies nothing and reports
+`0/0 passed`.
+
 ## Options
 
 - `-j, --jobs <N>`: files handled at once, in both phases; default 1 (serial). The copy
@@ -71,9 +77,15 @@ with code 1 and the target stays untouched.
   overlaps source reads with target reads. Results are still reported in manifest order.
   With `-j > 1` the progress line shows whichever in-flight file was touched last.
 - `--keep-source-name`: keep the source directory name in the target layout.
-- `--skip-unreadable`: skip unreadable source files instead of failing the preflight.
+- `--skip-unreadable`: carry on past unreadable source files instead of failing the
+  preflight. Each such file is listed once as a problem (with the reason the open failed)
+  and the run exits 1. The option cannot make sy skip the file, so the matching per-file
+  copy error is folded into that one entry; if sy manages to copy the file anyway, it
+  stays unverified because rcca removed it from the manifest.
 - `--force`: continue even when the target looks too small.
-- `--fail-fast`: abort on the first failure (mapped to sy's `max_errors = 1`).
+- `--fail-fast`: abort on the first failure (mapped to sy's `max_errors = 1`). Without it
+  there is no limit: every per-file error is collected and the run still prints its
+  summary and verifies what was copied.
 - `--quiet`: draw nothing, print the summary only.
 - `--verbose`: keep and print the complete failure list instead of the first 20.
 - `--keep-bad`: quarantine mismatching target files as `.<name>.badhash` instead of
@@ -101,7 +113,8 @@ VERIFY  100%   11.0/11.0 GiB  C7418.MP4
   the copy fills the first half and verification the second. During the copy the
   numerator grows by every finished file, skipped files included; during verification it
   grows with the bytes actually read (both sides are read, so that count is halved). A
-  fully successful run ends with the numerator equal to the denominator.
+  fully successful run ends with the numerator equal to the denominator. When the
+  denominator is 0 (every source file is empty) the percentage column shows `-`.
 - The numerator and the denominator use the denominator's unit and a fixed width, so the
   digits never shift while the line is redrawn.
 - Only the file name is shown; over-long names are truncated from the start so the
@@ -125,16 +138,22 @@ DST  /Volumes/MOD/200 个人目录/David/1020 01
 ```
 
 `Files` is the manifest (elapsed time at the end), `Copy` is sy's own accounting (it
-includes directory entries), `Transfer` counts regular files sy actually moved (finished transfers only), and
-`Verify` reports the files checked, their total size and how many passed. On failure the
-last line becomes `! Failed: N problems, listed below` with an indented list of up to 20
-examples; the number is the real total, so `--verbose` is the way to see them all. On
-Ctrl-C it becomes `! Interrupted: …` and the exit code is 130.
+includes directory entries), `Transfer` counts the regular files sy actually moved
+(finished transfers only, symlinks excluded), and `Verify` reports the files checked,
+their total size and how many passed; a file that was never hashed (target missing,
+source changed) contributes nothing to that size. On failure the last line becomes
+`! Failed: N problems, listed below` with an indented list of up to 20 examples; the
+number is the real total, so `--verbose` is the way to see them all. On Ctrl-C it becomes
+`! Interrupted: …` and the exit code is 130.
 
-Symlinks and special files in the source are handled separately: sy copies symlinks but
-rcca cannot hash them, and fifos, sockets and devices are not copied at all. Both cases
-print a one-line note on stderr (suppressed by `--quiet`) instead of disappearing from
-the counts.
+Symbolic links in the source are copied as links by sy but are not verified (rcca can
+only hash regular files); a one-line note on stderr (suppressed by `--quiet`) says so
+instead of letting them disappear from the counts.
+
+Special files (fifos, sockets, device nodes) are refused by the preflight with exit
+code 3, naming the first one: sy handle only regular files and symlinks, and would read
+a fifo as a normal file and block on it forever. Remove the file from the source and run
+again.
 
 Progress goes to stderr and stdout carries only the summary, so
 `rcca source target > log.txt` yields clean text. When stderr is not a TTY or `--quiet`
@@ -151,7 +170,7 @@ shows the one file being worked on.
 - 1: copy failure (including sy errors) or verification failure.
 - 2: usage error (source equals or nests with the target, unknown option, ...).
 - 3: preflight failure (source unusable, not enough space, 4 GiB cap on FAT, unreadable
-  source file, path rule conflict, target not writable).
+  source file, special file in the source, path rule conflict, target not writable).
 - 130: interrupted with Ctrl-C during verification.
 
 ## Behaviour notes
@@ -160,26 +179,35 @@ shows the one file being worked on.
   renames once, so the target never holds a final name with half the content.
 - Ctrl-C is not intercepted during the copy: the signal terminates the process and may
   leave `.sy-xxxxxxxx.tmp` files behind, clean them with `--clean-stale`. Only the
-  verification phase installs a handler and exits with 130.
+  verification phase installs a handler: the first Ctrl-C stops after the file being
+  hashed (summary printed, exit code 130), a second one ends the process at once with 130
+  and no summary. Verification only checks the flag between files, so the second signal
+  is the way out of a long single-file hash.
 - Verification compares the XXH64 of source and target from rcca's own manifest;
   mismatching target files are deleted by default, `--keep-bad` quarantines them, so a
   final file name always means "verified".
 - Symbolic links are copied as links by sy but are not verified (only regular files are).
 - Metadata: sy keeps the modification time and the permission bits.
+- The free-space preflight assumes a full copy (102% of the source bytes plus 64 MiB), so
+  a re-run into a nearly full target can be refused even though most files will be
+  skipped; `--force` overrides it.
 - Without a TTY or with `--quiet` nothing is drawn, only the summary is printed.
 
 ## Tests
 
 ```bash
-cargo test                                        # 77 tests (53 unit + 24 integration)
+cargo test                                        # 91 tests (58 unit + 33 integration)
 cargo clippy --all-targets -- -D warnings
 ```
 
 Integration tests cover: full copy and verify, overwriting, mirror delete,
 `--keep-source-name` layout, quiet mode, second run skipping unchanged files, mtime and
-mode preservation, symlinks, `--clean-stale`, idempotency, nested target (exit code 2),
-unreadable source (exit code 3 and `--skip-unreadable`), the delete guard refusing (exit
-code 1), and no partial final file after an interrupt.
+mode preservation, symlinks (including a symlink-only source), an empty source against a
+non-empty and an empty target, empty directories in the source, `--clean-stale`,
+idempotency, nested target (exit code 2, no directory left behind), unreadable source
+(exit code 3, `--skip-unreadable` reported once), a fifo and a socket in the source (exit
+code 3), the delete guard refusing (exit code 1), and no partial final file after an
+interrupt.
 
 ## Measured (macOS arm64, APFS, 120 files of 3 MiB)
 

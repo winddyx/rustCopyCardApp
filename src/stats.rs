@@ -74,12 +74,8 @@ pub struct Stats {
     pub files_skipped: AtomicUsize,
     /// Ctrl-C 置位的取消标志。
     pub cancel: AtomicBool,
-    /// 因严重问题主动中止。
-    pub abort: AtomicBool,
     // 下面几个字段需要整体读写，用 `Mutex` 保护。字段私有，只能通过方法访问，
     // 这样锁不会被外部忘记获取。
-    // 中止原因（只记录第一次），`Option` 表示"尚未中止"。
-    abort_reason: Mutex<Option<String>>,
     // 进度行显示的当前文件名。
     current: Mutex<String>,
     // 失败记录本体。
@@ -123,8 +119,6 @@ impl Stats {
             copied_files: AtomicUsize::new(0),
             files_skipped: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
-            abort: AtomicBool::new(false),
-            abort_reason: Mutex::new(None),
             // 空字符串表示"还没有当前文件"，进度行据此决定是否显示文件名。
             current: Mutex::new(String::new()),
             // `FailureLog` 派生了 `Default`，这里用它构造零值。
@@ -177,34 +171,10 @@ impl Stats {
             .unwrap_or_default()
     }
 
-    /// 请求中止，并记下原因（只记第一次）。
-    ///
-    /// `swap(true, ...)` 返回交换前的值：若原本是 `false`，说明本次是第一个请求者，
-    /// 才去写原因；这样多个线程同时请求时原因不会被覆盖。
-    pub fn request_abort(&self, reason: impl Into<String>) {
-        // 先转成 `String`，避免在持锁期间再做类型转换。
-        let reason = reason.into();
-        if !self.abort.swap(true, Ordering::SeqCst) {
-            // `SeqCst` 是最强的内存序：这里要求所有线程对"是否已中止"看到同样的顺序。
-            if let Ok(mut guard) = self.abort_reason.lock() {
-                *guard = Some(reason);
-            }
-        }
-    }
-
-    /// 读取中止原因；从未中止时返回 `None`。
-    pub fn abort_reason(&self) -> Option<String> {
-        // `g` 的类型是 `MutexGuard<Option<String>>`，本身没有 `clone` 方法，
-        // 这里靠自动解引用调用到 `Option<String>::clone`，得到一份与锁无关的副本。
-        // `ok()` 把 `Result<Guard, PoisonError>` 变成 `Option<Guard>`，
-        // `and_then` 再在其上取 `Option<String>`。
-        self.abort_reason.lock().ok().and_then(|g| g.clone())
-    }
-
-    /// 任一停止条件成立即返回真，供工作线程在循环里检查。
+    /// 是否已收到停止请求（Ctrl-C），供工作线程在循环里检查。
     pub fn stop_requested(&self) -> bool {
-        // 两处都用 `Relaxed`：这里只关心"最终能看到置位"，不关心与其他变量的先后。
-        self.cancel.load(Ordering::Relaxed) || self.abort.load(Ordering::Relaxed)
+        // `Relaxed` 足够：这里只关心"最终能看到置位"，不关心与其他变量的先后。
+        self.cancel.load(Ordering::Relaxed)
     }
 }
 

@@ -20,6 +20,9 @@ pub const VERSION: &str = "v0.4.1";
 /// 删除保护阈值（百分比），与上游 `--max-delete 50%` 一致。
 const DELETE_THRESHOLD: u8 = 50;
 
+/// sy 用 0 表示"不限制逐文件错误数"，这也是 rcca 的默认语义。
+const UNLIMITED_ERRORS: usize = 0;
+
 /// 传给 sy 的复制选项。
 ///
 /// 结构体没有 `Default` 实现，而是提供一个语义明确的 `mirror()` 构造器：
@@ -30,9 +33,8 @@ pub struct Options {
     pub delete: bool,
     /// 交给 sy 的并行传输数（对应它的 `-j`），1 表示串行。
     pub jobs: usize,
-    /// 错误上限，用来实现 --fail-fast。
-    /// 用 `Option<usize>` 而不是 `usize`：`None` 表示"不设上限"，
-    /// 这与"上限为 0"是两种不同的语义，用 `Option` 才能区分。
+    /// 错误上限，用来实现 --fail-fast；`None` 表示不限，
+    /// 由 `effective_max_errors` 换算成 sy 的表示法。
     pub max_errors: Option<usize>,
 }
 
@@ -49,6 +51,14 @@ impl Options {
             max_errors: None,
         }
     }
+}
+
+/// 把 `max_errors` 换算成 sy 的取值：`None` -> 0（sy 表示不限），`Some(n)` -> `n`。
+///
+/// 注意不能只在上限存在时才赋值：`SyncConfig::test_default()` 里 `max_errors` 是 100，
+/// 留着不动会让"默认不限"变成一条没有出现在文档里的 100 条上限。
+fn effective_max_errors(opts: &Options) -> usize {
+    opts.max_errors.unwrap_or(UNLIMITED_ERRORS)
 }
 
 /// 注册"某个文件开始复制"时的回调，界面据此显示文件名。
@@ -106,11 +116,8 @@ pub fn copy_tree(source: &Path, target: &Path, opts: &Options) -> Result<SyncSta
     // `format!("{DELETE_THRESHOLD}%")` 直接引用同名的常量，得到 "50%"。
     // sy 期望这个字段是 `Option<String>` 形式的阈值描述，所以包进 `Some`。
     config.max_delete = Some(format!("{DELETE_THRESHOLD}%"));
-    // `if let Some(limit)` 只在调用方要求限制错误数时才覆盖上游默认值；
-    // `Option<usize>` 是 `Copy` 的，因此从借用的 `opts` 里读出来不涉及移动。
-    if let Some(limit) = opts.max_errors {
-        config.max_errors = limit;
-    }
+    // 显式写入上限：`None` 换算成 sy 的 0（不限），不能沿用 `test_default()` 的 100。
+    config.max_errors = effective_max_errors(opts);
 
     // sy 是异步实现，需要 tokio 运行时。rcca 本身是同步程序，因此在这里临时建一个，
     // 用 `block_on` 把异步调用当同步用；运行时随后随作用域结束而销毁。
@@ -144,6 +151,18 @@ mod tests {
         assert_eq!(opts.jobs, 1);
         // `Option` 用 `is_none()` 判断，比 `assert_eq!(x, None)` 更清楚。
         assert!(opts.max_errors.is_none());
+    }
+
+    #[test]
+    fn only_fail_fast_caps_the_error_count() {
+        // 默认不限错误数：必须映射成 sy 的 0，而不是沿用 `test_default()` 的 100。
+        assert_eq!(effective_max_errors(&Options::mirror()), 0);
+        // --fail-fast 对应"最多一个错误"。
+        let fail_fast = Options {
+            max_errors: Some(1),
+            ..Options::mirror()
+        };
+        assert_eq!(effective_max_errors(&fail_fast), 1);
     }
 
     #[test]

@@ -27,6 +27,31 @@ fn target_inside_source_is_usage_error() {
     let nested = src.path().join("out");
 
     rcca().arg(src.path()).arg(&nested).assert().code(2);
+    // 被拒绝的命令不能在源介质上留下痕迹：目标目录要到检查通过之后才创建。
+    assert!(
+        !nested.exists(),
+        "a rejected target must not be created inside the source"
+    );
+}
+
+#[test]
+fn a_parent_component_in_the_target_cannot_smuggle_it_into_the_source() {
+    // `missing/../card/out` 里的 `..` 必须先消解，否则嵌套判断与真实的创建位置对不上。
+    let parent = TempDir::new().unwrap();
+    let src = parent.path().join("card");
+    fs::create_dir_all(&src).unwrap();
+    write_file(&src, "a.bin", b"x");
+    let target = parent.path().join("missing/../card/out");
+
+    rcca().arg(&src).arg(&target).assert().code(2);
+    assert!(
+        !src.join("out").exists(),
+        "the rejected target must not appear inside the source"
+    );
+    assert!(
+        !parent.path().join("missing").exists(),
+        "not even the intermediate directory may be created"
+    );
 }
 
 #[test]
@@ -91,8 +116,89 @@ fn skip_unreadable_copies_the_rest() {
             Some(1),
             "with --skip-unreadable only individual files may fail"
         );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // 一个文件只算一个问题：sy 对同一个文件的失败由 preflight 的记录去重。
+        let listed: Vec<&str> = stdout
+            .lines()
+            .filter(|line| line.starts_with("    - "))
+            .filter(|line| line.contains("secret.bin"))
+            .collect();
+        assert_eq!(listed.len(), 1, "one problem per skipped file: {stdout}");
     }
     assert!(dst.path().join("ok.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_unreadable_reports_a_nested_file_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // 多段相对路径：去重靠 `target_root.join(rel)`，嵌套路径也必须与 sy 的目标路径对上。
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "100MEDIA/ok.bin", b"good");
+    write_file(src.path(), "100MEDIA/secret.bin", b"data");
+    let path = src.path().join("100MEDIA/secret.bin");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = rcca()
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--skip-unreadable")
+        .output()
+        .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    if output.status.code() != Some(0) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "output: {stdout}");
+        let listed = stdout
+            .lines()
+            .filter(|line| line.starts_with("    - "))
+            .filter(|line| line.contains("100MEDIA/secret.bin"))
+            .count();
+        assert_eq!(listed, 1, "a nested skip is reported once: {stdout}");
+    }
+    assert!(dst.path().join("100MEDIA/ok.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn fail_fast_aborts_on_the_first_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // 默认不限错误数；--fail-fast 仍然映射成 sy 的 max_errors = 1，复制中途放弃。
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        write_file(src.path(), &format!("sub/{name}"), b"payload");
+    }
+    let locked = dst.path().join("sub");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = rcca()
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--fail-fast")
+        .output()
+        .unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // root 下写只读目录仍会成功，此时没有错误，断言跳过。
+    if output.status.code() != Some(0) {
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Max errors exceeded"),
+            "the copy aborts on the first error: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "an aborted copy prints no summary: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -153,6 +259,57 @@ fn wrapped_copy_errors_stay_on_one_line() {
     assert!(
         bullet.contains("Cause:") && bullet.contains("Permission denied"),
         "the whole message stays on the bullet: {bullet}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_the_source_fails_preflight() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "real.bin", b"data");
+    let fifo = src.path().join("pipe.fifo");
+    let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // 管道节点交给 sy 会被当作普通文件读取并永久阻塞，因此必须在 preflight 拒绝。
+    let created = unsafe { libc::mkfifo(path.as_ptr(), 0o644) };
+    assert_eq!(created, 0, "could not create the fifo");
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a special file is a preflight failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("special file"), "stderr: {stderr}");
+    assert!(stderr.contains("pipe.fifo"), "name the file: {stderr}");
+    assert!(
+        !dst.path().join("real.bin").exists(),
+        "nothing may be copied when the source is refused"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_in_the_source_fails_preflight() {
+    use std::os::unix::net::UnixListener;
+
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "real.bin", b"data");
+    // `UnixListener` 在文件系统里留下一个套接字节点；绑定成功即创建。
+    let _socket = UnixListener::bind(src.path().join("ipc.sock")).unwrap();
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a socket is a preflight failure: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

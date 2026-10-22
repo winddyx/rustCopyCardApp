@@ -1,10 +1,12 @@
 //! rcca 的入口：前置检查与遍历，经内嵌 sy 引擎复制，再做 rcca 自己的校验，
 //! 最后把结果映射成退出码。
 
-// 标准库：文件操作、路径借用、原子内存序、共享所有权、计时器。
+// 标准库：集合、文件操作、路径借用与拥有、原子内存序、共享所有权、计时器。
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -82,16 +84,9 @@ fn run(cli: Cli) -> Result<i32> {
             source.display()
         )));
     }
-    // 目标目录不存在就创建，让用户不必事先建好。
-    fs::create_dir_all(&cli.target).map_err(|err| {
-        Error::preflight_io(
-            format!("cannot create target directory: {}", cli.target.display()),
-            err,
-        )
-    })?;
-
     // `--keep-source-name` 时多一层以源目录名命名的目录，否则目标根就是用户给的目标目录。
-    let target_root = if cli.keep_source_name {
+    // 这一段必须在创建任何目录之前完成：源没有名字属于用法错误，不该先在磁盘上留下目录。
+    let requested_target = if cli.keep_source_name {
         // `file_name()` 返回 `Option`：像 `/` 这样的路径没有最后一段名字。
         // `ok_or_else` 把 `None` 变成 `Err`，闭包只在需要时报错信息才执行。
         let name = source.file_name().ok_or_else(|| {
@@ -102,16 +97,34 @@ fn run(cli: Cli) -> Result<i32> {
         // 默认按内容复制，目标根就是用户给的目标目录。
         cli.target.clone()
     };
-    // 先建目录，再做规范化：`canonicalize` 要求路径存在。
-    fs::create_dir_all(&target_root)
-        .map_err(|err| Error::preflight_io("cannot create the target root", err))?;
-    // 目标也规范一次，否则同一个目录的两种写法会让嵌套判断失效。
-    let target_root = fs::canonicalize(&target_root)
-        .map_err(|err| Error::preflight_io("cannot resolve the target root", err))?;
-
+    // 先把目标解析成规范绝对路径（不创建任何东西），再做嵌套判断：
+    // 被拒绝的命令因此不会在源介质上留下空目录。
+    let resolved_target = resolve_target(&requested_target).map_err(|err| {
+        Error::preflight_io(
+            format!("cannot resolve the target: {}", requested_target.display()),
+            err,
+        )
+    })?;
     // 源与目标不能相同、不能互相嵌套，否则复制会递归或互相污染。
-    if let Some(problem) = paths::nesting_problem(&source, &target_root) {
+    if let Some(problem) = paths::nesting_problem(&source, &resolved_target) {
         // 布局错误属于参数问题（退出码 2），不是运行期的前置检查失败。
+        return Err(Error::usage(problem));
+    }
+    // 通过检查后才建目录，让用户不必事先建好。
+    fs::create_dir_all(&resolved_target).map_err(|err| {
+        Error::preflight_io(
+            format!(
+                "cannot create the target directory: {}",
+                resolved_target.display()
+            ),
+            err,
+        )
+    })?;
+    // 目标也规范一次，否则同一个目录的两种写法会让后续判断失效。
+    let target_root = fs::canonicalize(&resolved_target)
+        .map_err(|err| Error::preflight_io("cannot resolve the target root", err))?;
+    // 规范化之后再做一次同样的判断：符号链接可能让两次结果不同。
+    if let Some(problem) = paths::nesting_problem(&source, &target_root) {
         return Err(Error::usage(problem));
     }
     // 真正写一个探测文件来确认可写，而不是只看权限位。
@@ -121,7 +134,10 @@ fn run(cli: Cli) -> Result<i32> {
         let removed = clean_stale(&target_root);
         // `--quiet` 时连这类提示也不打印。
         if removed > 0 && !cli.quiet {
-            eprintln!("rcca: removed {removed} leftover temp files");
+            eprintln!(
+                "rcca: removed {removed} leftover temp file{}",
+                plural(removed)
+            );
         }
     }
 
@@ -153,8 +169,7 @@ fn run(cli: Cli) -> Result<i32> {
         )));
     }
 
-    // sy 会复制符号链接但 rcca 无法对其计算哈希，特殊文件则完全跳过，
-    // 两者都要明确提示，不能从计数里悄悄消失。
+    // sy 会复制符号链接但 rcca 无法对其计算哈希，因此要明确提示，不能从计数里悄悄消失。
     if !cli.quiet && manifest.skipped_symlinks > 0 {
         // 单复数分开处理，让提示读起来自然。
         let (noun, verb) = if manifest.skipped_symlinks == 1 {
@@ -168,23 +183,34 @@ fn run(cli: Cli) -> Result<i32> {
             manifest.skipped_symlinks
         );
     }
-    if !cli.quiet && manifest.skipped_special > 0 {
-        let noun = if manifest.skipped_special == 1 {
-            "special file (fifo, socket, device) is"
-        } else {
-            "special files (fifos, sockets, devices) are"
-        };
-        eprintln!("rcca: {} {noun} not copied", manifest.skipped_special);
+    // 特殊文件（管道、套接字、设备节点）不能进镜像：sy 只认常规文件与符号链接，
+    // 交给它会当作普通文件去读——管道会一直阻塞、设备可能读不完（实测 mkfifo 后
+    // 运行会永久挂起）。因此这里直接拒绝，并指出第一个条目的位置。
+    if manifest.skipped_special > 0 {
+        // 只取第一个路径：出错信息需要给出可操作的线索，不需要列出全部。
+        let first = manifest
+            .first_special
+            .as_ref()
+            .map(|rel| rel.display())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Err(Error::preflight(format!(
+            "{} special file{} (fifo, socket, device) cannot be copied, remove {} from the source",
+            manifest.skipped_special,
+            plural(manifest.skipped_special),
+            first
+        )));
     }
 
     // 逐个打开源文件确认可读；结果只包含失败项，因此列表为空即全部可读。
     let unreadable = scan::probe_readable(&source, &manifest.files);
+    // 被 preflight 跳过的文件在目标侧的路径。sy 自己扫描源，无法被告知跳过这些文件，
+    // 因此它仍会尝试复制并失败；那些错误与这里的记录是同一个问题，合并时要去重。
+    let mut skipped_dests: HashSet<PathBuf> = HashSet::new();
     if !unreadable.is_empty() {
         if cli.skip_unreadable {
             // 用 `HashSet<&RelPath>` 做集合查表：元素是引用，因此不复制路径本身，
             // 其生命周期受 `unreadable` 的约束，正好覆盖下面 `retain` 的范围。
-            let bad: std::collections::HashSet<&paths::RelPath> =
-                unreadable.iter().map(|(rel, _)| rel).collect();
+            let bad: HashSet<&paths::RelPath> = unreadable.iter().map(|(rel, _)| rel).collect();
             // `retain` 原地删除不满足条件的元素，闭包拿到的是 `&Entry`。
             manifest.files.retain(|entry| !bad.contains(&entry.rel));
             // 清单变了，总字节数必须重算，否则进度分母会偏大。
@@ -192,10 +218,15 @@ fn run(cli: Cli) -> Result<i32> {
             // 被跳过的文件也要计入统计与失败样例，让汇总里能看到它们。
             for (rel, err) in &unreadable {
                 stats.files_skipped.fetch_add(1, Ordering::Relaxed);
+                skipped_dests.insert(target_root.join(rel.as_path()));
                 stats.note_failure(format!("skipping unreadable file {}: {err}", rel.display()));
             }
             if !cli.quiet {
-                eprintln!("rcca: skipped {} unreadable files", unreadable.len());
+                eprintln!(
+                    "rcca: skipped {} unreadable file{}",
+                    unreadable.len(),
+                    plural(unreadable.len())
+                );
             }
         } else {
             // 默认策略：源有读不了的文件就整体拒绝，避免复制出残缺的目标。
@@ -236,39 +267,10 @@ fn run(cli: Cli) -> Result<i32> {
         }
     }
 
-    // 空清单不必启动复制和校验，直接给出一份零值汇总。
-    if manifest.files.is_empty() {
-        // 先停掉进度行，避免它与汇总输出抢 stderr。
-        live.finish();
-        // 字段逐一写 0：这份结构体没有实现 `Default`，必须把 18 个字段写全。
-        let summary = Summary {
-            // 路径需要拥有所有权，这里克隆一份（`source` 后面还要用）。
-            source: source.clone(),
-            target: target_root.clone(),
-            files_total: 0,
-            bytes_total: 0,
-            // `elapsed()` 返回从 `started` 到现在经过的时长。
-            elapsed: started.elapsed(),
-            created: 0,
-            updated: 0,
-            skipped: 0,
-            deleted: 0,
-            transferred_files: 0,
-            bytes_transferred: 0,
-            verified: 0,
-            verify_failed: 0,
-            checked_bytes: 0,
-            failure_count: 0,
-            // 空的失败列表用 `Vec::new()`，不需要类型标注。
-            failures: Vec::new(),
-            // 这两个字段决定打印行为，直接沿用命令行选择。
-            verbose: cli.verbose,
-            interrupted: false,
-        };
-        // 汇总写到 stdout，然后按成功退出。
-        report::print(&summary);
-        return Ok(0);
-    }
+    // 这里刻意没有"清单为空就早退"的分支：清单为空也照常跑一遍 sy，因为它还要建立空目录、
+    // 复制符号链接、按镜像语义删除目标里多出来的文件。早退会让"空源目录"变成一次静默的
+    // 空操作：目标里的旧文件既不被删除，退出码也报成功，与镜像语义和 README 的说明都矛盾。
+    // 校验阶段随后自然什么也不做（清单为空，0/0 passed）。
 
     // ---------- 阶段 3：经内嵌 sy 引擎复制 ----------
     // 总数拿到后才能计算百分比，因此在这一步才告诉进度行。
@@ -314,8 +316,14 @@ fn run(cli: Cli) -> Result<i32> {
     let copy = engine::copy_tree(&source, &target_root, &engine_opts)?;
     // sy 的逐文件错误逐条并入失败列表，`note_failure` 负责计数与截断。
     for err in &copy.errors {
+        // sy 的 `path` 是目标路径（`SyncError::path`），因此措辞写成"复制到"。
+        // preflight 已判为不可读的文件 sy 仍会尝试复制并失败，那条错误与上面的
+        // "skipping unreadable file" 是同一个问题，跳过以免同一文件被计两次。
+        if skipped_dests.contains(&err.path) {
+            continue;
+        }
         stats.note_failure(format!(
-            "copying {}: {} ({})",
+            "copying to {}: {} ({})",
             err.path.display(),
             err.error,
             err.action
@@ -367,11 +375,6 @@ fn run(cli: Cli) -> Result<i32> {
     failures.extend(verify_report.errors.clone());
     // 计数同样要加上校验失败数，才能与列表口径一致。
     failure_count += verify_failed(&verify_report);
-    // 主动中止时补一条说明，并把计数加一。
-    if let Some(reason) = stats.abort_reason() {
-        failures.push(format!("aborted on request: {reason}"));
-        failure_count += 1;
-    }
 
     // 汇总结构体在这里一次性组装好，随后交给 `report::print` 排版。
     let summary = Summary {
@@ -422,7 +425,10 @@ fn verify_failed(report: &verify::VerifyReport) -> usize {
     report.mismatched.len() + report.missing.len() + report.errors.len()
 }
 
-/// 安装 Ctrl-C 处理函数，只把取消标志置位，让校验循环自行收尾。
+/// 安装 Ctrl-C 处理函数：第一次请求优雅收尾，第二次立即结束进程。
+///
+/// 校验只在文件之间检查取消标志，单个超大文件的哈希期间无法中断；把第二个信号当作
+/// "立刻退出"（退出码 130 保持一致），用户因此始终有一个强制收尾的手段。
 ///
 /// `ctrlc::set_handler` 要求闭包 `'static` 且可在其他线程执行，
 /// 因此同样用 `move` 把 `Arc` 的克隆送入闭包。返回值忽略：
@@ -430,10 +436,75 @@ fn verify_failed(report: &verify::VerifyReport) -> usize {
 fn install_signal_handler(stats: &Arc<Stats>) {
     // 克隆一份 `Arc` 交给闭包，原引用留给调用方。
     let stats = Arc::clone(stats);
+    // 信号计数放在闭包里：0 表示还没收到过信号。
+    let signals = AtomicUsize::new(0);
     let _ = ctrlc::set_handler(move || {
-        // `SeqCst` 保证校验线程一定能看到这个置位。
-        stats.cancel.store(true, Ordering::SeqCst);
+        // `fetch_add` 返回增加前的值：第一次是 0，之后都不再是 0。
+        if signals.fetch_add(1, Ordering::SeqCst) == 0 {
+            // `SeqCst` 保证校验线程一定能看到这个置位。
+            stats.cancel.store(true, Ordering::SeqCst);
+        } else {
+            // 第二次直接结束进程：不打印汇总，目标里可能留着未校验的文件。
+            std::process::exit(130);
+        }
     });
+}
+
+/// 把可能还不存在的路径解析成规范绝对路径，且不创建任何目录。
+///
+/// 分两步：先做纯字面的规范化（`.` 丢掉、`..` 弹掉上一段），再找到最长的已存在前缀并
+/// 规范化它（解析符号链接），最后把剩余片段拼回去。这样嵌套判断看到的路径与
+/// `create_dir_all` 将要创建的路径一致，既不会漏判，也不会在判断之前往源介质里写目录。
+fn resolve_target(path: &Path) -> std::io::Result<PathBuf> {
+    // 相对路径先拼上当前目录，后续判断都基于绝对路径。
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // 字面规范化：`..` 必须在这里消解，否则它会活到拼回阶段，
+    // 让 `starts_with` 判断与真实的创建位置对不上（例如 `missing/../card/out`）。
+    let mut lexical = PathBuf::new();
+    for comp in absolute.components() {
+        match comp {
+            // `CurDir` 没有意义，直接跳过。
+            Component::CurDir => {}
+            // 根目录之上再退无可退，`pop` 会返回 false 并保持原样。
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            // 其余片段（根、Windows 前缀、普通名字）原样拼上。
+            other => lexical.push(other.as_os_str()),
+        }
+    }
+    // 从完整路径往回退，直到找到一个已存在的前缀；`rest` 按从深到浅的顺序记录退掉的片段。
+    let mut existing = lexical.as_path();
+    let mut rest: Vec<&OsStr> = Vec::new();
+    while !existing.exists() {
+        // 退到没有父目录或没有名字（根目录）时停止，此时字面结果已经是能给的最优答案。
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return Ok(lexical);
+        };
+        rest.push(name);
+        existing = parent;
+    }
+    // 已存在的前缀规范化后再把退掉的片段按原顺序拼回。
+    let mut resolved = fs::canonicalize(existing)?;
+    for name in rest.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+/// 单复数后缀：1 时为空串，其余为 `s`。
+///
+/// 提示语里的计数都用它拼后缀，避免出现 "1 unreadable files" 这类写法。
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 /// 写入一个探测文件来确认目标目录可写。
