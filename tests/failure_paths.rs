@@ -130,6 +130,39 @@ fn skip_unreadable_copies_the_rest() {
 
 #[cfg(unix)]
 #[test]
+fn a_symlinked_target_is_reported_not_verified() {
+    // 目标里放着指回源（或任意位置）的符号链接，且大小与 mtime 与源一致时，
+    // sy 会跳过这一项；此时若跟着链接去哈希，就会把"没复制"报成"已验证"。
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    let source_file = src.path().join("f.bin");
+    fs::write(&source_file, b"AAAAA").unwrap();
+    let link = dst.path().join("f.bin");
+    // 链接文本 "f.bin" 恰好 5 字节，与源文件大小一致。
+    std::os::unix::fs::symlink("f.bin", &link).unwrap();
+    // 链接自身的 mtime 与源文件对齐（`set_symlink_file_times` 不跟随链接）。
+    let mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&source_file).unwrap());
+    filetime::set_symlink_file_times(&link, mtime, mtime).unwrap();
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "output: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("target is not a regular file (symlink)"),
+        "a symlink must not count as a verified copy: {stdout}"
+    );
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is left in place for the user to inspect"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn skip_unreadable_reports_a_nested_file_once() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -25,8 +25,6 @@ pub const VERBOSE_FAILURE_DETAIL_BYTES: usize = 4 * 1024 * 1024;
 /// 不需要原子类型。锁被释放前不会有第二个线程读它，因此无需额外同步。
 #[derive(Default)]
 struct FailureLog {
-    // 记录了多少条失败，与 `examples.len()` 不是一回事：样例会被截断，计数不会。
-    count: usize,
     // 已保存样例占用的字节总数，用来执行 `MAX_FAILURE_DETAIL_BYTES` 预算。
     detail_bytes: usize,
     // 真正保留下来的失败文本，按记录顺序排列。
@@ -35,18 +33,16 @@ struct FailureLog {
 
 // 这个 `impl` 块只有私有方法，因此只有本文件内部能调用。
 impl FailureLog {
-    /// 记录一条失败。计数总会加一，但样例满了或超出字节预算就只记数不存内容。
+    /// 记录一条失败样例。样例满了或超出字节预算就只丢弃内容，计数由 `Stats` 负责。
     ///
     /// 参数用 `String` 而不是 `&str`：调用方拼好的信息需要被保存下来，
     /// 借用的话生命周期撑不过本次调用。这里也不克隆，直接移动进 `Vec`。
     fn record(&mut self, message: String, max_examples: usize, max_bytes: usize) {
-        // `&mut self` 允许修改自身字段；锁保证同时只有一个线程能做到这一点。
-        self.count += 1;
-        // 样例条数到上限：只累加计数，立刻返回。
+        // 样例条数到上限：不保存内容。
         if self.examples.len() >= max_examples {
             return;
         }
-        // 再加一条就会超出字节预算：同样只累加计数。
+        // 再加一条就会超出字节预算：同样不保存内容。
         // `message.len()` 是 UTF-8 字节数，与预算口径一致。
         if self.detail_bytes + message.len() > max_bytes {
             return;
@@ -74,6 +70,9 @@ pub struct Stats {
     pub files_skipped: AtomicUsize,
     /// Ctrl-C 置位的取消标志。
     pub cancel: AtomicBool,
+    // 失败总条数。放在原子变量里而不是锁里：锁中毒时计数也不能丢，
+    // 否则"有失败"的判定会退化成 fail-open（退出码 0）。
+    failure_total: AtomicUsize,
     // 下面几个字段需要整体读写，用 `Mutex` 保护。字段私有，只能通过方法访问，
     // 这样锁不会被外部忘记获取。
     // 进度行显示的当前文件名。
@@ -119,6 +118,7 @@ impl Stats {
             copied_files: AtomicUsize::new(0),
             files_skipped: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
+            failure_total: AtomicUsize::new(0),
             // 空字符串表示"还没有当前文件"，进度行据此决定是否显示文件名。
             current: Mutex::new(String::new()),
             // `FailureLog` 派生了 `Default`，这里用它构造零值。
@@ -146,11 +146,13 @@ impl Stats {
         self.current.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// 记录一次失败；计数和详情都受上限约束。
+    /// 记录一次失败；计数不受上限约束，样例受上限约束。
     pub fn note_failure(&self, message: String) {
+        // 先记计数：即使下面的锁中毒，这次失败也不会从汇总里消失（退出码不会误报 0）。
+        self.failure_total.fetch_add(1, Ordering::Relaxed);
         // 上限是 `Copy` 的二元组，先复制出来，避免持锁期间再去读 `self` 的字段。
         let (examples, detail_bytes) = self.failure_limits;
-        // 锁中毒时丢弃这条失败，比让整个运行 panic 更合适。
+        // 锁中毒时只丢样例，计数已经记过，比让整个运行 panic 更合适。
         if let Ok(mut log) = self.failures.lock() {
             log.record(message, examples, detail_bytes);
         }
@@ -158,8 +160,8 @@ impl Stats {
 
     /// 失败总条数，含未保存详情的那些。
     pub fn failure_count(&self) -> usize {
-        // `map` 在 `Ok` 时取字段，`unwrap_or(0)` 处理中毒的情形。
-        self.failures.lock().map(|l| l.count).unwrap_or(0)
+        // 计数在原子变量里，锁中毒也不影响它。
+        self.failure_total.load(Ordering::Relaxed)
     }
 
     /// 已保存的失败样例（可能少于总数）。

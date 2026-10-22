@@ -259,17 +259,43 @@ fn verify_one(
     let src = source.join(entry.rel.as_path());
     let dst = target.join(entry.rel.as_path());
 
-    // 目标文件无法检查是错误，而不是"文件不存在"这两种情况要分开处理，
-    // 否则权限问题会被误导成复制没有发生。
-    match fs::metadata(&dst) {
-        // 元数据可读：继续后面的校验。
-        Ok(_) => {}
+    // 目标必须是常规文件，且必须在打开之前判掉：`metadata` 会跟随符号链接，
+    // 于是"目标是指向源的链接"会把内容读成与源一致，把没复制报成已验证；
+    // 目标若是管道，`File::open` 会永久阻塞。这两种情况都不能进哈希环节。
+    match fs::symlink_metadata(&dst) {
+        // 常规文件：继续后面的校验。
+        Ok(meta) if meta.is_file() => {}
+        // 其余类型（链接、目录、管道、设备）都不算复制成功。
+        Ok(meta) => {
+            return (
+                Outcome::Failed(format!(
+                    "{rel}: target is not a regular file ({})",
+                    describe_type(&meta)
+                )),
+                0,
+            )
+        }
+        // 目标不存在是另一种问题，单独归类。
         Err(err) if err.kind() == io::ErrorKind::NotFound => return (Outcome::Missing(rel), 0),
+        // 其余读取失败（权限等）不能被误报成"复制没有发生"。
         Err(err) => {
             return (
                 Outcome::Failed(format!("{rel}: cannot inspect target: {err}")),
                 0,
             )
+        }
+    }
+
+    // 源侧同样只接受常规文件：清单只收常规文件，扫描后被换成链接或管道就不该再读。
+    if let Ok(meta) = fs::symlink_metadata(&src) {
+        if !meta.is_file() {
+            return (
+                Outcome::Failed(format!(
+                    "{rel}: source is not a regular file ({})",
+                    describe_type(&meta)
+                )),
+                0,
+            );
         }
     }
 
@@ -339,6 +365,18 @@ fn stability_issue(source: &Path, entry: &Entry) -> Option<crate::scan::SourceIs
         .into_iter()
         .next()
         .flatten()
+}
+
+/// 描述一个条目的类型，用于"不是常规文件"这类错误信息。
+fn describe_type(meta: &fs::Metadata) -> &'static str {
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        "symlink"
+    } else if kind.is_dir() {
+        "directory"
+    } else {
+        "special file"
+    }
 }
 
 /// 计算哈希，并把读到的字节数累加到进度行读取的计数器上。
@@ -586,6 +624,68 @@ mod tests {
         // 应当归入 errors 而不是 missing。
         assert!(report.missing.is_empty(), "{:?}", report.missing);
         assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn a_symlinked_target_is_not_verified() {
+        #[cfg(unix)]
+        {
+            let src = tempfile::tempdir().unwrap();
+            let dst = tempfile::tempdir().unwrap();
+            let source_file = src.path().join("f.bin");
+            fs::write(&source_file, b"payload").unwrap();
+            // 目标位置上放一个指回源的符号链接：跟过去哈希必然相同，
+            // 但那不是"已经复制到目标卷"的证据。
+            std::os::unix::fs::symlink(&source_file, dst.path().join("f.bin")).unwrap();
+
+            let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+            let report = run(
+                &manifest.files,
+                src.path(),
+                dst.path(),
+                &base_options(),
+                &Stats::new(),
+            );
+            assert_eq!(report.matched, 0, "{:?}", report.mismatched);
+            assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+            assert!(
+                report.errors[0].contains("not a regular file"),
+                "{:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_target_is_reported_instead_of_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        // 0 字节的源文件与 0 字节的管道节点大小相同，sy 会跳过它，
+        // 于是打开目标做哈希时会永久阻塞——类型检查必须在这之前拦下。
+        fs::write(src.path().join("f.bin"), b"").unwrap();
+        let fifo = dst.path().join("f.bin");
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+
+        let manifest = crate::scan::scan(src.path(), dst.path()).unwrap();
+        let report = run(
+            &manifest.files,
+            src.path(),
+            dst.path(),
+            &base_options(),
+            &Stats::new(),
+        );
+        assert_eq!(report.matched, 0);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].contains("not a regular file"),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]

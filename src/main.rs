@@ -143,6 +143,24 @@ fn run(cli: Cli) -> Result<i32> {
 
     // 取目标卷的文件系统类型：FAT 系列有 4 GiB 单文件上限，需要提前拦截。
     let fs_type = fs_type_name(&target_root);
+    // 目标卷的可用空间在扫描结束后才能算需求，这里先取一次快照。
+    let free = free_space(&target_root);
+    // 这两项检查依赖平台能力：拿不到类型或容量时必须明说，不能让用户以为已经检查过。
+    // Windows 上两者都返回 `None`，因此那里每次运行都会看到这两行提示。
+    if !cli.quiet {
+        if fs_type.is_none() {
+            eprintln!(
+                "rcca: warning: the target filesystem type is unknown on this platform, \
+                 the 4 GiB FAT check is skipped"
+            );
+        }
+        if free.is_none() {
+            eprintln!(
+                "rcca: warning: free space on the target is unknown on this platform, \
+                 the space check is skipped"
+            );
+        }
+    }
 
     // ---------- 阶段 2：遍历源目录，检查目标 ----------
     // 传入闭包把扫描进度接到进度行上；`|files|` 借用外层的 `view`。
@@ -240,7 +258,7 @@ fn run(cli: Cli) -> Result<i32> {
     }
 
     // 剩余空间检查：`saturating_mul` 在上溢时停在最大值，不会 panic。
-    if let Some(free) = free_space(&target_root) {
+    if let Some(free) = free {
         // 需要 102%（给临时文件和原地替换留余量）再加 64 MiB 余量。
         let needed = manifest.total_bytes.saturating_mul(102) / 100 + 64 * 1024 * 1024;
         // `--force` 可以跳过这个检查，用于用户确知空间足够的情形。

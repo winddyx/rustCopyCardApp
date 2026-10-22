@@ -107,7 +107,7 @@ pub struct Cli {
     // 占位符写法，`default_value_t` 指定默认值（这里写成 1），
     // `value_parser = parse_jobs` 指定自定义解析函数，解析失败时报用法错误。
     // 这些说明写成普通注释：写进文档注释会多出一段 `--help` 文字。
-    /// Number of parallel file transfers passed to sy (sy's -j), 1 means serial
+    /// Number of parallel file transfers passed to sy (sy's -j), 1-64, 1 means serial
     #[arg(short = 'j', long, value_name = "N", default_value_t = 1, value_parser = parse_jobs)]
     pub jobs: usize,
 
@@ -118,14 +118,17 @@ pub struct Cli {
     pub color: ColorChoice,
 }
 
-/// 拒绝 0 和非数字：sy 至少需要一个传输槽位。
+/// `-j` 的上限。每个校验线程持有一块 1 MiB 缓冲区，sy 侧也会同时发起同样多的传输，
+/// 过大的取值只会把内存与线程数推高，对复制速度没有帮助。
+pub const MAX_JOBS: usize = 64;
+
+/// 拒绝 0、非数字和超过上限的取值：sy 至少需要一个传输槽位，而线程数必须有界。
 ///
 /// 这个函数要交给 clap 当 `value_parser`，所以签名是固定的：
 /// 输入 `&str`，输出 `Result<T, String>`，`Err` 里的文字会作为报错原因打印。
 ///
-/// 流程分两步：先 `parse()` 把字符串转成 `usize`（`map_err` 把解析错误改写成
-/// 带原值的友好提示），再单独判断 0。因为要求是 0 也非法，用 `if` 提前返回比
-/// 拼一条复杂的错误信息更直观。
+/// 流程分三步：先 `parse()` 把字符串转成 `usize`（`map_err` 把解析错误改写成
+/// 带原值的友好提示），再判断 0 与上限。分开判断比拼一条复杂的错误信息更直观。
 fn parse_jobs(raw: &str) -> Result<usize, String> {
     // `raw.parse()` 的目标类型由左边的 `let jobs: usize` 推断出来，这里显式标注了类型，
     // 否则链式调用上的 `map_err` 无法确定要解析成什么。
@@ -139,6 +142,10 @@ fn parse_jobs(raw: &str) -> Result<usize, String> {
     if jobs == 0 {
         // clap 会把这里返回的 `String` 打印成"invalid value ...: jobs must be at least 1"。
         return Err("jobs must be at least 1".to_string());
+    }
+    if jobs > MAX_JOBS {
+        // 超过上限时明确拒绝：几百个线程同时各持一块缓冲区没有意义。
+        return Err(format!("jobs must be at most {MAX_JOBS}"));
     }
     // 包成 `Ok` 返回；最后一个表达式就是函数返回值，所以不写 `return`。
     Ok(jobs)
@@ -197,6 +204,14 @@ mod tests {
         // 0 由 parse_jobs 拒绝，非数字由 usize 的 parse 拒绝，两条路径都要覆盖。
         assert!(Cli::try_parse_from(["rcca", "src", "dst", "-j", "0"]).is_err());
         assert!(Cli::try_parse_from(["rcca", "src", "dst", "-j", "many"]).is_err());
+    }
+
+    #[test]
+    fn jobs_is_capped() {
+        // 每个工作线程各持一块 1 MiB 缓冲区，因此上限必须写死并被拒绝，而不是悄悄夹紧。
+        assert!(Cli::try_parse_from(["rcca", "src", "dst", "-j", "64"]).is_ok());
+        assert!(Cli::try_parse_from(["rcca", "src", "dst", "-j", "65"]).is_err());
+        assert!(Cli::try_parse_from(["rcca", "src", "dst", "-j", "100000"]).is_err());
     }
 
     #[test]

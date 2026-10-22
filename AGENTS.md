@@ -68,15 +68,20 @@
   target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
   armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
   the recipe creates under `target/armv7-support`.
-- `make test` (`cargo test`): 58 unit tests in `src/`, 33 integration tests in `tests/`
+- `make test` (`cargo test`): 61 unit tests in `src/`, 34 integration tests in `tests/`
   (`cli_flow.rs`, `failure_paths.rs`).
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
 
 ## Invariants
 
 - Exit codes: 0 success; 1 copy failure (including sy errors) or verification failure;
-  2 usage error (nesting, unknown option, `--jobs 0`); 3 preflight failure; 130 Ctrl-C
-  during verification.
+  2 usage error (nesting, unknown option, `--jobs` outside 1-64); 3 preflight failure; 130
+  Ctrl-C during verification.
+- Verification hashes only when both sides are regular files (`symlink_metadata` +
+  `is_file()` before any `File::open`, `describe_type` for the message). A target that is a
+  symlink, directory or fifo is an `Outcome::Failed`, never `Matched`: following a link
+  would hash the source through the target and report an un-copied file as verified, and
+  opening a fifo blocks forever. Keep this check before the hashing.
 - Ctrl-C during the copy is not intercepted (the default signal handling ends the
   process and may leave `.sy-xxxxxxxx.tmp`, cleaned by `--clean-stale`). Only the
   verification phase installs a handler: the first signal asks for a graceful stop
@@ -112,7 +117,8 @@
 - The failure count in the result line comes from `Stats::failure_count()`, not from the
   length of the example list: the store is bounded (32 examples, 64 KiB), the count is
   not. `--verbose` raises both bounds so its list is complete. Failure text is flattened
-  to one line before printing, sy wraps its errors.
+  to one line before printing, sy wraps its errors. The count lives in an `AtomicUsize`
+  (`failure_total`) so a poisoned examples mutex cannot turn a failed run into exit 0.
 - The summary's `Transfer` row counts regular files only and pairs them with sy's
   `bytes_transferred`; the `Verify` row's byte figure covers only the files whose source
   side was actually hashed (`checked_bytes`), so a missing target contributes 0.
@@ -121,12 +127,16 @@
   still copied (the note is accurate only because sy runs regardless of the manifest).
   Special files never reach the copy: they fail the preflight (`skipped_special` and
   `first_special` only build that message).
-- `-j/--jobs` (default 1) applies to both phases: sy's `max_concurrent` for the copy, a
-  `std::thread::scope` pool with one buffer per worker for verification. Verification
-  collects one outcome per file and reports in manifest order, so results never depend on
-  worker order. Keep the default serial; above 1 the "current file" jumps.
+- `-j/--jobs` (default 1, maximum 64 — `cli::MAX_JOBS`, rejected above it) applies to both
+  phases: sy's `max_concurrent` for the copy, a `std::thread::scope` pool with one 1 MiB
+  buffer per worker for verification. Verification collects one outcome per file and
+  reports in manifest order, so results never depend on worker order. Keep the default
+  serial; above 1 the "current file" jumps.
 - The label is dim, everything else default colour. `--color auto|always|never`; `NO_COLOR`
   or `TERM=dumb` disables colour.
+- `fs_type_name` / `free_space` return `None` where rcca has no implementation (the current
+  Windows build). Both volume guards (4 GiB on FAT, free space) are then skipped, and a
+  stderr warning says so; never make them fail silently.
 
 ## Definition of done
 

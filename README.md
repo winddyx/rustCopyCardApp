@@ -75,7 +75,9 @@ directories is created on the target. Such a run verifies nothing and reports
 - `-j, --jobs <N>`: files handled at once, in both phases; default 1 (serial). The copy
   passes it straight to sy's `-j`; verification runs that many files in parallel, which
   overlaps source reads with target reads. Results are still reported in manifest order.
-  With `-j > 1` the progress line shows whichever in-flight file was touched last.
+  With `-j > 1` the progress line shows whichever in-flight file was touched last. The
+  value is capped at 64: every worker holds a 1 MiB buffer, so larger values only raise
+  memory and thread counts.
 - `--keep-source-name`: keep the source directory name in the target layout.
 - `--skip-unreadable`: carry on past unreadable source files instead of failing the
   preflight. Each such file is listed once as a problem (with the reason the open failed)
@@ -183,31 +185,36 @@ shows the one file being worked on.
   hashed (summary printed, exit code 130), a second one ends the process at once with 130
   and no summary. Verification only checks the flag between files, so the second signal
   is the way out of a long single-file hash.
-- Verification compares the XXH64 of source and target from rcca's own manifest;
-  mismatching target files are deleted by default, `--keep-bad` quarantines them, so a
-  final file name always means "verified".
+- Verification compares the XXH64 of source and target from rcca's own manifest, and both
+  sides must be regular files: a target that is a symlink, directory or fifo is reported
+  as a problem instead of being hashed through (a link pointing at the source would
+  otherwise hash equal and pass). Mismatching target files are deleted by default,
+  `--keep-bad` quarantines them, so a final file name always means "verified".
 - Symbolic links are copied as links by sy but are not verified (only regular files are).
 - Metadata: sy keeps the modification time and the permission bits.
 - The free-space preflight assumes a full copy (102% of the source bytes plus 64 MiB), so
   a re-run into a nearly full target can be refused even though most files will be
-  skipped; `--force` overrides it.
+  skipped; `--force` overrides it. On platforms where rcca cannot read the volume (the
+  current Windows build), the free-space and 4 GiB FAT checks are skipped and a warning
+  is printed instead of failing silently.
 - Without a TTY or with `--quiet` nothing is drawn, only the summary is printed.
 
 ## Tests
 
 ```bash
-cargo test                                        # 91 tests (58 unit + 33 integration)
+cargo test                                        # 95 tests (61 unit + 34 integration)
 cargo clippy --all-targets -- -D warnings
 ```
 
 Integration tests cover: full copy and verify, overwriting, mirror delete,
 `--keep-source-name` layout, quiet mode, second run skipping unchanged files, mtime and
-mode preservation, symlinks (including a symlink-only source), an empty source against a
-non-empty and an empty target, empty directories in the source, `--clean-stale`,
-idempotency, nested target (exit code 2, no directory left behind), unreadable source
-(exit code 3, `--skip-unreadable` reported once), a fifo and a socket in the source (exit
-code 3), the delete guard refusing (exit code 1), and no partial final file after an
-interrupt.
+mode preservation, symlinks (including a symlink-only source and a symlinked target that
+must not pass verification), an empty source against a non-empty and an empty target,
+empty directories in the source, `--clean-stale`, idempotency, nested target (exit code 2,
+no directory left behind, also with a `..` in the target), unreadable source (exit code 3,
+`--skip-unreadable` reported once, also for a nested path), a fifo and a socket in the
+source (exit code 3), `--fail-fast` aborting on the first error, the delete guard refusing
+(exit code 1), and no partial final file after an interrupt.
 
 ## Measured (macOS arm64, APFS, 120 files of 3 MiB)
 
