@@ -529,21 +529,68 @@ fn plural(count: usize) -> &'static str {
 ///
 /// 之所以真的写一次而不是检查权限位：ACL、只读挂载、磁盘配额等问题
 /// 只有实际写入才会暴露。探测文件名带上进程号，避免并发运行时互相干扰。
+///
+/// 创建用 `create_new`：如果事先存在同名条目（典型情况是别人放好的符号链接），
+/// 普通的创建会顺着链接写到别处去，而只接受"此名尚不存在"的打开不会跟随链接，
+/// 于是这种情况落到"换一个名字重试"，不会去碰链接指向的文件。
 fn check_writable(root: &Path) -> Result<()> {
-    // `std::process::id()` 返回当前进程号，拼进文件名即可做到互不干扰。
-    let probe = root.join(format!(".rcca-probe-{}", std::process::id()));
-    // `b"probe"` 是字节字面量，`fs::write` 接受任意 `AsRef<[u8]>`。
-    match fs::write(&probe, b"probe") {
-        Ok(()) => {
-            // 用完删除；即使删除失败也不影响可写性的判断，所以忽略结果。
-            let _ = fs::remove_file(&probe);
-            Ok(())
+    // `write_all` 来自 `Write` trait，须在本函数内引入；这样不会污染整个文件的作用域。
+    use std::io::Write;
+
+    // 每个候选名字只用一次；名字全被占用时如实报告，不能谎称可写。
+    const ATTEMPTS: usize = 4;
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        let probe = root.join(probe_name(attempt));
+        // 先打开再写：打开失败与写入失败都说明"这个目录写不进去"，但错误来源不同。
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(mut file) => {
+                // `b"probe"` 是字节字面量，`write_all` 接受任意 `&[u8]`。
+                let written = file.write_all(b"probe");
+                // 先关闭再删除：Windows 上句柄未关闭时删不掉文件。
+                drop(file);
+                // 用完删除；即使删除失败也不影响可写性的判断，所以忽略结果。
+                let _ = fs::remove_file(&probe);
+                // 写入失败说明目标写不进去，把上下文和原始错误一起返回（退出码 3）。
+                return written.map_err(|err| {
+                    Error::preflight_io(
+                        format!("target directory is not writable: {}", root.display()),
+                        err,
+                    )
+                });
+            }
+            // 名字被占用（残留文件、pid 复用或预先放好的同名条目）：换下一个名字。
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+            // 其余错误（权限、只读挂载等）直接就是答案。
+            Err(err) => {
+                return Err(Error::preflight_io(
+                    format!("target directory is not writable: {}", root.display()),
+                    err,
+                ))
+            }
         }
-        // 写入失败说明目标不可写，把上下文和原始错误一起返回（退出码 3）。
-        Err(err) => Err(Error::preflight_io(
-            format!("target directory is not writable: {}", root.display()),
-            err,
-        )),
+    }
+    Err(Error::preflight_io(
+        format!(
+            "cannot run the writability probe in the target, every candidate name is taken: {}",
+            root.display()
+        ),
+        last.unwrap_or_else(|| std::io::Error::other("no probe name was available")),
+    ))
+}
+
+/// 探测文件名：第一个候选是 `.rcca-probe-<pid>`，之后的候选再加序号后缀。
+fn probe_name(attempt: usize) -> String {
+    // `std::process::id()` 返回当前进程号，拼进文件名即可让并发运行互不干扰。
+    let pid = std::process::id();
+    if attempt == 0 {
+        format!(".rcca-probe-{pid}")
+    } else {
+        format!(".rcca-probe-{pid}-{attempt}")
     }
 }
 

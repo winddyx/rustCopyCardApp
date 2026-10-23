@@ -34,6 +34,9 @@
 - The target is resolved without creating it (`resolve_target`), so a layout that is
   rejected with exit 2 never leaves a directory behind. It is created only after the
   nesting check, then canonicalised and checked once more.
+- The writable-target probe (`check_writable`) is created with `create_new`, never with a
+  plain `fs::write`: a pre-placed symlink named like the probe would otherwise redirect the
+  write into whatever it points at. A taken candidate name means the next name is tried.
 - Special files (fifo, socket, device) are a preflight failure with exit 3, naming the
   first one. sy handles only regular files and symlinks: it would read a fifo as a normal
   file and block on it forever, and a socket fails with ENOTSUP. Do not turn this back
@@ -68,7 +71,7 @@
   target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
   armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
   the recipe creates under `target/armv7-support`.
-- `make test` (`cargo test`): 62 unit tests in `src/`, 34 integration tests in `tests/`
+- `make test` (`cargo test`): 63 unit tests in `src/`, 34 integration tests in `tests/`
   (`cli_flow.rs`, `failure_paths.rs`).
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
 

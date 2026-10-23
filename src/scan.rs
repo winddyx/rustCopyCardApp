@@ -238,7 +238,6 @@ pub fn scan_with_progress(
     }
 
     // `sort_by` 配合 `RelPath` 派生的 `Ord`，得到稳定的清单顺序。
-    // Keep files sorted by path so repeated runs behave the same.
     manifest.files.sort_by(|a, b| a.rel.cmp(&b.rel));
     // 最后一次上报，确保进度行显示的是最终数量。
     progress(manifest.files.len());

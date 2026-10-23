@@ -14,9 +14,6 @@ use sy::transport::local::LocalTransport;
 // `crate::` 前缀指本 crate 的根模块；`use` 里的花括号一次引入多个名字。
 use crate::error::{Error, Result};
 
-/// 此处内嵌的上游 sy 版本。
-pub const VERSION: &str = "v0.4.1";
-
 /// 删除保护阈值（百分比），与上游 `--max-delete 50%` 一致。
 const DELETE_THRESHOLD: u8 = 50;
 

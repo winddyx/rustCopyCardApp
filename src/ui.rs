@@ -18,7 +18,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 // 按"显示宽度"而不是字符个数计算列宽，中日韩等全角字符算两列。
-use unicode_width::UnicodeWidthStr;
+// 字符串整体用 `UnicodeWidthStr`，单个字符用 `UnicodeWidthChar`（避免为每个字符分配临时字符串）。
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // 统计状态与单位表来自 stats 模块，保证进度行与汇总使用同一套单位。
 use crate::stats::{Stats, BYTE_UNITS};
@@ -242,8 +243,9 @@ pub fn done_bytes(stats: &Stats) -> u64 {
 pub fn phase_bytes(phase: Phase, stats: &Stats) -> u64 {
     match phase {
         Phase::Verify => stats.hashed_bytes.load(Ordering::Relaxed) / 2,
-        // 扫描阶段不画字节列，这里并入复制阶段处理。
-        Phase::Scan | Phase::Copy => stats.copied_bytes.load(Ordering::Relaxed),
+        // 扫描阶段还没有自己的字节计数，不该借用复制阶段的数字。
+        Phase::Scan => 0,
+        Phase::Copy => stats.copied_bytes.load(Ordering::Relaxed),
     }
 }
 
@@ -254,9 +256,8 @@ fn render(state: &LiveHandle, stats: &Stats, width: usize, style: Style) -> Stri
     // `paint` 在需要颜色时给标签加上 SGR 序列；纯文本样式下原样返回。
     let label = paint(&pad_label(phase.label()), SGR_DIM, style);
     if phase == Phase::Scan {
-        // 扫描阶段还没有总数，只显示文件数，也没有百分比可言。
+        // 扫描阶段还不知道总字节数，因此只显示文件数，也没有百分比可言。
         let scanned = state.scanned.load(Ordering::Relaxed);
-        // 扫描阶段还不知道总字节数，因此只显示文件数，也没有百分比。
         return format!("{label} {scanned} files");
     }
 
@@ -383,9 +384,9 @@ fn truncate_start(s: &str, max_width: usize) -> String {
     let mut used = 0;
     // 从后往前收集字符，此时顺序是反的，最后需要 `reverse`。
     for ch in s.chars().rev() {
-        // `UnicodeWidthStr::width` 用显示宽度而不是字符个数，全角字符算两列。
-        // `ch.to_string()` 会分配一次小字符串，这里为了简洁可以接受。
-        let w = ch.to_string().width();
+        // `UnicodeWidthChar::width` 直接取单个字符的显示宽度，全角字符算两列。
+        // 取不到宽度的字符（控制字符）按 0 处理，与整串 `width()` 的口径一致。
+        let w = ch.width().unwrap_or(0);
         if used + w > target {
             break;
         }
@@ -411,7 +412,8 @@ fn truncate_end(s: &str, max_width: usize) -> String {
     let mut used = 0;
     // 正向收集，直到再加一个字符就会超出 `max_width - 1`（留位给省略号）。
     for ch in s.chars() {
-        let w = ch.to_string().width();
+        // 与 `truncate_start` 相同：单字符宽度按 `UnicodeWidthChar` 取，不分配临时字符串。
+        let w = ch.width().unwrap_or(0);
         if used + w > max_width - 1 {
             break;
         }
@@ -527,6 +529,19 @@ mod tests {
             .store(2 * 1024 * 1024 * 1024, Ordering::Relaxed);
         let line = render(&handle, &stats, 100, Style::PLAIN);
         assert!(line.contains("1.0/3.0 GiB"), "{line}");
+    }
+
+    #[test]
+    fn each_phase_reports_only_its_own_bytes() {
+        let stats = Stats::new();
+        stats.copied_bytes.store(4_096, Ordering::Relaxed);
+        // 校验两侧都读，合计 12 KiB，减半后是 6 KiB。
+        stats.hashed_bytes.store(12_288, Ordering::Relaxed);
+        // 扫描阶段没有自己的字节计数，不能借用复制阶段的数字。
+        assert_eq!(phase_bytes(Phase::Scan, &stats), 0);
+        // 两个画字节列的阶段各报各的，互不包含。
+        assert_eq!(phase_bytes(Phase::Copy, &stats), 4_096);
+        assert_eq!(phase_bytes(Phase::Verify, &stats), 6_144);
     }
 
     #[test]

@@ -7,7 +7,7 @@ verification of both sides are done by this tool.
 ## Build
 
 ```bash
-make dist               # release build: wipe dist/, build both platforms, write checksums
+make dist               # release build: wipe dist/, build every target, write checksums
 cargo build --release   # current platform only, binary at target/release/rcca
 ```
 
@@ -205,7 +205,7 @@ shows the one file being worked on.
 ## Tests
 
 ```bash
-cargo test                                        # 95 tests (61 unit + 34 integration)
+cargo test                                        # 97 tests (63 unit + 34 integration)
 cargo clippy --all-targets -- -D warnings
 ```
 
