@@ -115,7 +115,8 @@ impl LiveHandle {
         self.scanned.store(files, Ordering::Relaxed);
     }
 
-    /// 源文件总字节数；它的两倍就是整个运行的分母。扫描结束后调用一次。
+    /// 源文件总字节数。百分比的分母是它的两倍，字节列的分母就是它本身。
+    /// 扫描结束后调用一次。
     pub fn set_total(&self, bytes: u64) {
         self.total.store(bytes, Ordering::Relaxed);
     }
@@ -226,10 +227,24 @@ impl Drop for Live {
 }
 
 /// 到目前为止已完成的字节数：复制阶段处理的字节，加上已校验覆盖的字节
-/// （校验时两侧都要读，所以计数要减半）。
+/// （校验时两侧都要读，所以计数要减半）。这是百分比用的累计量，会一直增长到
+/// 源总字节数的两倍；字节列不用它，见 `phase_bytes`。
 pub fn done_bytes(stats: &Stats) -> u64 {
     // 两处 `load` 都是 `Relaxed`：这里只需要"大致当前"的数值。
     stats.copied_bytes.load(Ordering::Relaxed) + stats.hashed_bytes.load(Ordering::Relaxed) / 2
+}
+
+/// 当前阶段自己已处理的源字节数，字节列的分子。
+///
+/// 复制阶段是已复制的字节，校验阶段是已校验覆盖的字节（两侧都读，所以减半），
+/// 因此校验一开始分子重新从 0 起算。字节列只表达一个阶段的工作量，
+/// 分母始终是源总字节数，不出现两倍的合计。
+pub fn phase_bytes(phase: Phase, stats: &Stats) -> u64 {
+    match phase {
+        Phase::Verify => stats.hashed_bytes.load(Ordering::Relaxed) / 2,
+        // 扫描阶段不画字节列，这里并入复制阶段处理。
+        Phase::Scan | Phase::Copy => stats.copied_bytes.load(Ordering::Relaxed),
+    }
 }
 
 /// 把当前状态渲染成一整行文本。这个函数是纯函数，便于单元测试。
@@ -245,9 +260,9 @@ fn render(state: &LiveHandle, stats: &Stats, width: usize, style: Style) -> Stri
         return format!("{label} {scanned} files");
     }
 
-    // 总字节数在扫描结束时写入；两倍作为整个运行的分母。
+    // 总字节数在扫描结束时写入；两倍作为百分比的整个运行分母。
     let total = state.total.load(Ordering::Relaxed);
-    // 分母是总字节数的两倍（复制一半、校验一半）；`saturating_mul` 溢出时饱和到最大值而不是 panic。
+    // 百分比的分母是总字节数的两倍（复制一半、校验一半）；`saturating_mul` 溢出时饱和到最大值而不是 panic。
     let denom = total.saturating_mul(2);
     // 完成的字节不能超过分母，否则百分比会出现大于 100 的怪值。
     let done = done_bytes(stats).min(denom);
@@ -259,8 +274,9 @@ fn render(state: &LiveHandle, stats: &Stats, width: usize, style: Style) -> Stri
         // 宽度与 `{:>3}%` 一致（3 位数字 + `%`）。
         None => format!("{:>PCT_W$}", "-"),
     };
-    // 字节列自己决定单位与宽度，保证分子分母同一单位。
-    let bytes = bytes_columns(done, denom);
+    // 字节列只显示当前阶段自己的工作量，分母是源总字节数本身：显示两倍的合计
+    // 会让人以为要处理的数据量比实际大一倍。分子同样夹到总量，避免越界。
+    let bytes = bytes_columns(phase_bytes(phase, stats).min(total), total);
     // 当前文件名从 `Stats` 读取（那里是跨线程共享的）。
     let current = stats.current();
 
@@ -477,17 +493,40 @@ mod tests {
     #[test]
     fn line_shows_percent_bytes_and_file() {
         let stats = Stats::new();
-        // 直接写原子计数，模拟"复制阶段已经处理完全部源字节"。
-        stats.copied_bytes.store(3_000_000_000, Ordering::Relaxed);
+        // 直接写原子计数，模拟"复制阶段已经处理完全部源字节"；3 GiB 正好显示成 3.0。
+        let three_gib = 3 * 1024 * 1024 * 1024;
+        stats.copied_bytes.store(three_gib, Ordering::Relaxed);
         stats.set_current("A001_06141325_C026.mov");
-        let handle = view(Phase::Copy, 3_000_000_000);
+        let handle = view(Phase::Copy, three_gib);
         let line = render(&handle, &stats, 100, Style::PLAIN);
         assert!(line.starts_with("COPY  "), "{line}");
         // 复制完成等于整体进度的一半。
         assert!(line.contains("50%"), "the copy half is 50%: {line}");
+        // 字节列的分母是源总字节数本身，不是百分比用的两倍。
+        assert!(line.contains("3.0/3.0 GiB"), "{line}");
+        assert!(!line.contains("6.0"), "no doubled byte column: {line}");
         assert!(line.ends_with("A001_06141325_C026.mov"), "{line}");
         // 任何情况下都不能超出终端宽度。
         assert!(line.width() <= 100, "{line}");
+    }
+
+    #[test]
+    fn verify_restarts_the_byte_column_at_zero() {
+        let stats = Stats::new();
+        // 复制已完成，校验刚刚开始：百分比已在一半，字节列重新从 0 起算。
+        let three_gib = 3 * 1024 * 1024 * 1024;
+        stats.copied_bytes.store(three_gib, Ordering::Relaxed);
+        let handle = view(Phase::Verify, three_gib);
+        let line = render(&handle, &stats, 100, Style::PLAIN);
+        assert!(line.starts_with("VERIFY"), "{line}");
+        assert!(line.contains("50%"), "{line}");
+        assert!(line.contains("0.0/3.0 GiB"), "{line}");
+        // 校验覆盖了 1 GiB 后，字节列跟着增长，分母始终是源总字节数。
+        stats
+            .hashed_bytes
+            .store(2 * 1024 * 1024 * 1024, Ordering::Relaxed);
+        let line = render(&handle, &stats, 100, Style::PLAIN);
+        assert!(line.contains("1.0/3.0 GiB"), "{line}");
     }
 
     #[test]
@@ -503,12 +542,14 @@ mod tests {
     #[test]
     fn complete_run_reaches_one_hundred_percent() {
         let stats = Stats::new();
-        // 复制 5000 字节，校验两侧合计 10000 字节，恰好等于分母的两倍。
-        stats.copied_bytes.store(5_000, Ordering::Relaxed);
-        stats.hashed_bytes.store(10_000, Ordering::Relaxed);
-        let handle = view(Phase::Verify, 5_000);
+        // 复制 5 KiB，校验两侧合计 10 KiB，恰好等于分母的两倍。
+        stats.copied_bytes.store(5 * 1024, Ordering::Relaxed);
+        stats.hashed_bytes.store(10 * 1024, Ordering::Relaxed);
+        let handle = view(Phase::Verify, 5 * 1024);
         let line = render(&handle, &stats, 80, Style::PLAIN);
         assert!(line.contains("100%"), "{line}");
+        // 校验阶段两侧各读 5 KiB，字节列按一侧计算正好是源总字节数。
+        assert!(line.contains("5.0/5.0 KiB"), "{line}");
     }
 
     #[test]
@@ -517,9 +558,11 @@ mod tests {
         // 计数异常偏高时，`min(denom)` 保证不会显示超过 100%。
         stats.copied_bytes.store(9_999, Ordering::Relaxed);
         stats.hashed_bytes.store(99_999, Ordering::Relaxed);
-        let handle = view(Phase::Verify, 5_000);
+        let handle = view(Phase::Verify, 5 * 1024);
         let line = render(&handle, &stats, 80, Style::PLAIN);
         assert!(line.contains("100%"), "{line}");
+        // 计数虚高时字节列的分子也只到源总字节数为止。
+        assert!(line.contains("5.0/5.0 KiB"), "{line}");
     }
 
     #[test]

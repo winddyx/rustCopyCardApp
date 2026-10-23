@@ -104,8 +104,8 @@ speed, no ETA:
 
 ```
 SCAN   128 files
-COPY     23%    2.6/11.0 GiB  A001_06140008_C008.mov
-VERIFY   75%    8.2/11.0 GiB  C7418.MP4
+COPY     23%    5.1/11.0 GiB  A001_06140008_C008.mov
+VERIFY   75%    5.5/11.0 GiB  C7418.MP4
 VERIFY  100%   11.0/11.0 GiB  C7418.MP4
 ```
 
@@ -117,8 +117,11 @@ VERIFY  100%   11.0/11.0 GiB  C7418.MP4
   grows with the bytes actually read (both sides are read, so that count is halved). A
   fully successful run ends with the numerator equal to the denominator. When the
   denominator is 0 (every source file is empty) the percentage column shows `-`.
-- The numerator and the denominator use the denominator's unit and a fixed width, so the
-  digits never shift while the line is redrawn.
+- The byte columns after the percentage cover one phase only, so their denominator is the
+  total source bytes itself, never twice that amount. The copy is measured in copied
+  bytes, and verification restarts from zero and is measured in verified bytes (one side
+  of the two reads). Numbers and denominator use the denominator's unit and a fixed width,
+  so the digits never shift while the line is redrawn.
 - Only the file name is shown; over-long names are truncated from the start so the
   extension survives. On a narrow terminal the file name is dropped first, then the byte
   columns, leaving label and percentage.

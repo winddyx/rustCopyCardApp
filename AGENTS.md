@@ -68,7 +68,7 @@
   target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
   armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
   the recipe creates under `target/armv7-support`.
-- `make test` (`cargo test`): 61 unit tests in `src/`, 34 integration tests in `tests/`
+- `make test` (`cargo test`): 62 unit tests in `src/`, 34 integration tests in `tests/`
   (`cli_flow.rs`, `failure_paths.rs`).
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
 
@@ -110,6 +110,11 @@
   skipped ones; the verify numerator is bytes read, halved because both sides are read.
   When the denominator is 0 (every source file is empty) the percentage column shows
   `-`, because a byte-based percentage is undefined there.
+- The byte columns after the percentage cover one phase against the total source bytes
+  themselves (`ui::phase_bytes`), never the doubled percentage denominator: `COPY`
+  measures copied bytes, `VERIFY` restarts at zero and measures verified bytes. Keep the
+  two denominators separate: a byte column showing twice the data is the misreading this
+  layout exists to avoid.
 - Labels `SCAN` / `COPY` / `VERIFY` are padded to 6 columns, the file name starts at
   column 8, over-long names are truncated from the start so the extension survives.
 - stdout carries the summary only, so `rcca source target > log` is clean text. Without a
