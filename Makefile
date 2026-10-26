@@ -11,6 +11,11 @@ BIN     := rcca
 DIST    := dist
 VERSION := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
 
+# 校验和工具：macOS 上是 `shasum -a 256`，Windows 上 `mingw32-make win-dist
+# SHA256=sha256sum` 覆盖。两者的清单都能被 `shasum -c` 与 `sha256sum -c` 读取，
+# 只是 Windows 的 sha256sum 会在文件名前加上二进制模式标记 `*`。
+SHA256 ?= shasum -a 256
+
 MAC_TARGET  := aarch64-apple-darwin
 WIN_TARGET  := x86_64-pc-windows-gnu
 LNX_X64     := x86_64-unknown-linux-musl
@@ -50,7 +55,7 @@ RUST_LLD := $(shell rustc --print sysroot)/lib/rustlib/$(shell rustc -vV | sed -
 # compiler_builtins already provide the symbols and an empty archive satisfies the flag.
 ARMV7_SUPPORT := $(CURDIR)/target/armv7-support
 
-.PHONY: all dist makedist macos-arm64 windows-x64 linux-x64 linux-armv7 linux-armv8 upx-check checksums test lint clean
+.PHONY: all dist win-dist makedist macos-arm64 windows-x64 linux-x64 linux-armv7 linux-armv8 upx-check checksums win-checksums test lint clean
 
 all: dist
 
@@ -70,6 +75,17 @@ dist:
 
 # kept for the old spelling
 makedist: dist
+
+# Windows 主机上的发行构建：只产出本平台的产物。另外四个目标需要 macOS SDK 与 zig，
+# 在 Windows 上不存在，所以不放进这里，也不假装它们成功。与 `dist` 相同，先清空 dist/。
+win-dist:
+	rm -rf $(DIST)
+	@echo "== rcca $(VERSION) (windows only) =="
+	$(MAKE) --no-print-directory windows-x64
+	$(MAKE) --no-print-directory win-checksums
+	@echo "== $(DIST) =="
+	@ls -lh $(DIST)
+	@cat $(DIST)/SHA256SUMS
 
 # The packed targets need upx on PATH; missing tooling stops the run instead of
 # silently shipping unpacked-only artifacts.
@@ -127,7 +143,11 @@ linux-armv8: upx-check
 	@echo "built $(ARMV8_ARTIFACT) and $(ARMV8_UPX_ARTIFACT)"
 
 checksums:
-	@cd $(DIST) && shasum -a 256 $(notdir $(ARTIFACTS)) > SHA256SUMS
+	@cd $(DIST) && $(SHA256) $(notdir $(ARTIFACTS)) > SHA256SUMS
+
+# Windows 主机上只有两个产物，清单因此单独生成。
+win-checksums:
+	@cd $(DIST) && $(SHA256) $(notdir $(WIN_ARTIFACT) $(WIN_UPX_ARTIFACT)) > SHA256SUMS
 
 test:
 	cargo test

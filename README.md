@@ -47,6 +47,35 @@ brew install zig                            # C compiler/sysroot for the musl ta
 Linux targets (`vendor`-free, see `Cargo.toml`), so the first `make dist` after a clean
 takes a few minutes. Every run wipes `dist/` first, so no stale artifact survives.
 
+Building and testing natively on Windows uses the same `x86_64-pc-windows-gnu` target;
+`make` is not required there:
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu   # host toolchain with the GNU linker
+winget install BrechtSanders.WinLibs.POSIX.UCRT         # or any other mingw-w64
+rustup run stable-x86_64-pc-windows-gnu cargo test
+rustup run stable-x86_64-pc-windows-gnu cargo clippy --all-targets -- -D warnings
+```
+
+The host toolchain has to be the GNU one: build scripts and proc macros are compiled for
+the host, so a `msvc` host still needs `link.exe` even when the target is GNU.
+
+`make dist` cannot run on a Windows host: the macOS artifact needs the Apple SDK and the
+three musl artifacts need `zig`, neither of which exists there. `make win-dist` builds the
+two Windows artifacts and the checksum file only, wiping `dist/` first just like `dist`:
+
+```bash
+winget install UPX.UPX                                  # upx is required for the packed copy
+# run inside Git Bash, which supplies the POSIX shell, install, rm and sha256sum
+RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu mingw32-make win-dist SHA256=sha256sum
+cd dist && sha256sum -c SHA256SUMS
+```
+
+`RUSTUP_TOOLCHAIN` makes the plain `cargo` inside the Makefile use the GNU host toolchain,
+and `SHA256` overrides the `shasum -a 256` default (`shasum` is not part of Git for
+Windows). The resulting `dist/SHA256SUMS` lists the two Windows artifacts only, and both
+`sha256sum -c` and `shasum -a 256 -c` accept it.
+
 Other entry points: `make test` runs every test, `make lint` runs clippy plus the
 format check, `make clean` removes `target/` and `dist/`.
 
@@ -93,7 +122,8 @@ directories is created on the target. Such a run verifies nothing and reports
 - `--keep-bad`: quarantine mismatching target files as `.<name>.badhash` instead of
   deleting them.
 - `--verify-no-cache`: bypass the page cache while hashing (macOS `F_NOCACHE`, Linux
-  `posix_fadvise`).
+  `posix_fadvise`). Windows has neither call, so the option prints a warning saying it has
+  no effect instead of looking as if it worked.
 - `--clean-stale`: remove leftover `.sy-*.tmp` files from the target before starting.
 - `--color auto|always|never`: colour policy for the progress line, default `auto`.
 
@@ -162,7 +192,9 @@ again.
 
 Progress goes to stderr and stdout carries only the summary, so
 `rcca source target > log.txt` yields clean text. When stderr is not a TTY or `--quiet`
-is given, nothing is drawn and no thread is started: stderr stays empty.
+is given, nothing is drawn and no thread is started: stderr stays empty. The same holds
+on a Windows console that cannot be switched to ANSI escape handling, so no raw escape
+sequences are ever printed.
 
 sy's own planning messages, overall bar and per-file bars are all off; the file name and
 byte counts arrive through two callbacks added in `vendor/sy` (see
@@ -200,24 +232,39 @@ shows the one file being worked on.
   skipped; `--force` overrides it. On platforms where rcca cannot read the volume (the
   current Windows build), the free-space and 4 GiB FAT checks are skipped and a warning
   is printed instead of failing silently.
+- Windows specifics: `fs::canonicalize` returns `\\?\C:\...` paths, which the preflight
+  strips before anything is printed, so `SRC`/`DST` and the failure list show the same
+  path the user typed. The path limits are counted the way Windows counts them (259
+  UTF-16 code units in total, 255 per segment), so a name of 90 CJK characters is
+  accepted there while the same name is correctly rejected on a filesystem that limits
+  bytes. The console output code page is switched to UTF-8 for the run and restored
+  before exit, otherwise Chinese file names would be mangled on a GBK console; the
+  progress line is only drawn when the terminal accepts ANSI escape sequences
+  (`ENABLE_VIRTUAL_TERMINAL_PROCESSING`), and a console that refuses them gets the
+  summary without the line instead of raw escape codes.
 - Without a TTY or with `--quiet` nothing is drawn, only the summary is printed.
 
 ## Tests
 
 ```bash
-cargo test                                        # 97 tests (63 unit + 34 integration)
+cargo test                                        # 100 tests (64 unit + 36 integration)
 cargo clippy --all-targets -- -D warnings
 ```
 
+The Windows run is smaller because the Unix-only cases are compiled out: 64 unit tests
+plus 24 integration tests (symlinks, fifos, sockets, POSIX permission failures and the
+SIGINT test need Unix).
+
 Integration tests cover: full copy and verify, overwriting, mirror delete,
 `--keep-source-name` layout, quiet mode, second run skipping unchanged files, mtime and
-mode preservation, symlinks (including a symlink-only source and a symlinked target that
-must not pass verification), an empty source against a non-empty and an empty target,
-empty directories in the source, `--clean-stale`, idempotency, nested target (exit code 2,
-no directory left behind, also with a `..` in the target), unreadable source (exit code 3,
-`--skip-unreadable` reported once, also for a nested path), a fifo and a socket in the
-source (exit code 3), `--fail-fast` aborting on the first error, the delete guard refusing
-(exit code 1), and no partial final file after an interrupt.
+mode preservation, a tampered target caught by the hash with and without `--keep-bad`,
+symlinks (including a symlink-only source and a symlinked target that must not pass
+verification), an empty source against a non-empty and an empty target, empty directories
+in the source, `--clean-stale`, idempotency, nested target (exit code 2, no directory left
+behind, also with a `..` in the target), unreadable source (exit code 3, `--skip-unreadable`
+reported once, also for a nested path), a fifo and a socket in the source (exit code 3),
+`--fail-fast` aborting on the first error, the delete guard refusing (exit code 1), and no
+partial final file after an interrupt.
 
 ## Measured (macOS arm64, APFS, 120 files of 3 MiB)
 

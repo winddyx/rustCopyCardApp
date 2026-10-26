@@ -142,6 +142,16 @@ fn disable_read_cache(file: &File) {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn disable_read_cache(_file: &File) {}
 
+/// 本平台是否真的有办法让哈希绕过页缓存。
+///
+/// `disable_read_cache` 在没有实现的平台上是个空函数，`--verify-no-cache` 因此不会
+/// 改变任何结果（Windows 上的哈希仍然来自系统缓存）。调用方据此打印提示，而不是
+/// 让这个开关看起来生效了。
+pub fn no_cache_supported() -> bool {
+    // `cfg!` 在编译期展开成 `true`/`false`，不会被优化成一个运行时分支。
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
 /// 单个文件的校验结果，先存起来，等全部结束后再按顺序组装报告。
 ///
 /// 用枚举而不是元组，是为了让"匹配/缺失/不一致/出错"这四种情况在类型层面互斥。

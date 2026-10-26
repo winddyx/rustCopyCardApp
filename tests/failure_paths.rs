@@ -2,7 +2,11 @@
 
 use std::fs;
 use std::path::Path;
+// 这两个 import 只服务于 Unix 上的 SIGINT 测试；不加 `#[cfg]` 会让其他目标上出现
+// "unused import" 警告，`clippy -D warnings` 因此在 Windows 上失败。
+#[cfg(unix)]
 use std::process::{Command as StdCommand, Stdio};
+#[cfg(unix)]
 use std::time::Duration;
 
 use assert_cmd::Command;

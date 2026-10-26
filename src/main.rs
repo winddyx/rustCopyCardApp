@@ -16,6 +16,8 @@ use clap::Parser;
 // 库 crate（`lib.rs` 声明的 `rcca`）里的各模块。二进制把它当外部依赖引用，
 // 因此路径前缀是 `rcca::` 而不是 `crate::`。
 use rcca::cli::Cli;
+// 控制台准备：Windows 上的 UTF-8 代码页切换与恢复。
+use rcca::console;
 // `Options as EngineOptions` 起了别名：本文件后面还有一个 `verify::Options`，
 // 重名时用别名能避免写全路径。
 use rcca::engine::{self, Options as EngineOptions};
@@ -34,7 +36,10 @@ const VERIFY_CHUNK: usize = 1024 * 1024;
 
 fn main() {
     // `parse()` 在参数非法时会打印帮助并直接结束进程，因此返回类型是 `Cli` 而不是 `Result`。
+    // 它排在最前面：用法错误不该留下任何副作用，包括下面要改的控制台代码页。
     let cli = Cli::parse();
+    // 之后打印的都是 UTF-8 字节：中文目录名、`·` 与 `✓` 都依赖控制台按 UTF-8 解码。
+    console::use_utf8();
     // 失败统一在这里打印并转成退出码，`run` 内部因此只负责返回错误。
     let code = match run(cli) {
         // 成功时 `run` 直接给出退出码（0 或 130 等）。
@@ -46,6 +51,8 @@ fn main() {
             err.exit_code()
         }
     };
+    // 控制台代码页是全局状态，退出前恢复成原来的值，别影响同一窗口里之后的程序。
+    console::restore();
     // 用 `std::process::exit` 而不是从 `main` 返回：它会立刻结束进程，不执行析构函数。
     // 因此所有需要收尾的资源（比如进度行）都必须在 `run` 里显式结束。
     std::process::exit(code);
@@ -77,6 +84,9 @@ fn run(cli: Cli) -> Result<i32> {
     let source = fs::canonicalize(&cli.source).map_err(|err| {
         Error::preflight_io(format!("source unavailable: {}", cli.source.display()), err)
     })?;
+    // Windows 上 canonicalize 的结果带 `\\?\` 前缀；去掉它，后续的显示与提示才和用户
+    // 给的路径一致（长度上限已由清单检查保证，去掉前缀不会引入超长路径）。
+    let source = paths::strip_verbatim(&source);
     // 源必须是目录：文件、设备节点等都不能作为复制来源。
     if !source.is_dir() {
         return Err(Error::preflight(format!(
@@ -123,6 +133,8 @@ fn run(cli: Cli) -> Result<i32> {
     // 目标也规范一次，否则同一个目录的两种写法会让后续判断失效。
     let target_root = fs::canonicalize(&resolved_target)
         .map_err(|err| Error::preflight_io("cannot resolve the target root", err))?;
+    // 与源同样的处理：去掉 Windows 的 `\\?\` 前缀，汇总与错误提示因此只显示普通路径。
+    let target_root = paths::strip_verbatim(&target_root);
     // 规范化之后再做一次同样的判断：符号链接可能让两次结果不同。
     if let Some(problem) = paths::nesting_problem(&source, &target_root) {
         return Err(Error::usage(problem));
@@ -158,6 +170,13 @@ fn run(cli: Cli) -> Result<i32> {
             eprintln!(
                 "rcca: warning: free space on the target is unknown on this platform, \
                  the space check is skipped"
+            );
+        }
+        // 同样属于"能力缺失时必须明说"：没有实现时这个开关不改变任何结果。
+        if cli.verify_no_cache && !verify::no_cache_supported() {
+            eprintln!(
+                "rcca: warning: --verify-no-cache has no effect on this platform, \
+                 the hashes still come from the page cache"
             );
         }
     }
@@ -463,6 +482,8 @@ fn install_signal_handler(stats: &Arc<Stats>) {
             stats.cancel.store(true, Ordering::SeqCst);
         } else {
             // 第二次直接结束进程：不打印汇总，目标里可能留着未校验的文件。
+            // 这条路径同样绕过了 `main` 的收尾，所以自己把控制台代码页恢复回去。
+            console::restore();
             std::process::exit(130);
         }
     });
@@ -501,7 +522,8 @@ fn resolve_target(path: &Path) -> std::io::Result<PathBuf> {
     while !existing.exists() {
         // 退到没有父目录或没有名字（根目录）时停止，此时字面结果已经是能给的最优答案。
         let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-            return Ok(lexical);
+            // 这条路径会进错误提示，因此同样去掉 Windows 的 `\\?\` 前缀。
+            return Ok(paths::strip_verbatim(&lexical));
         };
         rest.push(name);
         existing = parent;
@@ -511,7 +533,8 @@ fn resolve_target(path: &Path) -> std::io::Result<PathBuf> {
     for name in rest.iter().rev() {
         resolved.push(name);
     }
-    Ok(resolved)
+    // `canonicalize` 在 Windows 上带 `\\?\` 前缀；调用方会把它写进提示，先还原成普通写法。
+    Ok(paths::strip_verbatim(&resolved))
 }
 
 /// 单复数后缀：1 时为空串，其余为 `s`。

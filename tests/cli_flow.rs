@@ -436,3 +436,69 @@ fn rerun_is_idempotent() {
         fs::read(src.path().join("100MEDIA/camera_A001.MOV")).unwrap()
     );
 }
+
+/// 把目标文件改成同样大小、同样 mtime，但内容不同：sy 会认为它没变而跳过，
+/// 只有 rcca 的哈希能发现差异。这是"最终文件名意味着已验证"的关键路径。
+fn tamper_with_the_same_size_and_mtime(target: &Path, replacement: &[u8]) {
+    let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(target).unwrap());
+    fs::write(target, replacement).unwrap();
+    filetime::set_file_mtime(target, mtime).unwrap();
+}
+
+#[test]
+fn a_tampered_target_is_reported_and_removed() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "a.bin", b"AAAAAAAA");
+    rcca().arg(src.path()).arg(dst.path()).assert().success();
+
+    let target = dst.path().join("a.bin");
+    tamper_with_the_same_size_and_mtime(&target, b"BBBBBBBB");
+
+    let output = rcca().arg(src.path()).arg(dst.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(output.status.code(), Some(1), "output: {stdout}");
+    assert!(
+        stdout.contains("0 created"),
+        "sy skips an unchanged size and mtime: {stdout}"
+    );
+    assert!(
+        stdout.contains("hash mismatch"),
+        "the hash is the only thing that can catch this: {stdout}"
+    );
+    assert!(
+        stdout.contains("0/1 passed"),
+        "the tampered file did not pass: {stdout}"
+    );
+    // 默认删除不一致的目标文件，这样留在磁盘上的最终文件名一定意味着"已验证"。
+    assert!(!target.exists(), "a mismatching target file is removed");
+}
+
+#[test]
+fn keep_bad_quarantines_the_tampered_target() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    write_file(src.path(), "a.bin", b"AAAAAAAA");
+    rcca().arg(src.path()).arg(dst.path()).assert().success();
+
+    let target = dst.path().join("a.bin");
+    tamper_with_the_same_size_and_mtime(&target, b"BBBBBBBB");
+
+    let output = rcca()
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--keep-bad")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        !target.exists(),
+        "the mismatching file must not keep its final name"
+    );
+    let quarantined = dst.path().join(".a.bin.badhash");
+    assert_eq!(
+        fs::read(&quarantined).unwrap(),
+        b"BBBBBBBB",
+        "the rejected content is kept for inspection"
+    );
+}

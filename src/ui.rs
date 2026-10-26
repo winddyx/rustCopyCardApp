@@ -432,13 +432,67 @@ fn terminal_width() -> Option<usize> {
     terminal_size::terminal_size().map(|(w, _)| w.0 as usize)
 }
 
-/// 判断是否需要绘制：stderr 是终端且没有指定 `--quiet`。
+/// 判断是否需要绘制：stderr 是终端、没有指定 `--quiet`，并且终端能解释转义序列。
 ///
 /// `IsTerminal` 是标准库的 trait，`is_terminal()` 用来区分交互终端与重定向、
 /// 管道的情况；重定向时不绘制，日志文件里就不会留下转义序列。
 pub fn interactive(quiet: bool) -> bool {
-    // 两个条件都很重要：重定向时即使不 quiet 也不应画，quiet 时即使是终端也不画。
-    io::stderr().is_terminal() && !quiet
+    // 三个条件缺一不可：重定向时不画，quiet 时不画，终端不支持 ANSI 时也不画。
+    io::stderr().is_terminal() && !quiet && ansi_supported()
+}
+
+/// Windows 控制台必须显式打开 ANSI 转义序列处理，其他平台恒为真。
+///
+/// 进度行靠 `\r`、`\x1b[2K` 和颜色序列原地重绘，这些序列只有在终端开启
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` 时才会被解释。Windows Terminal 默认开启，
+/// 老的 conhost 默认关闭，此时序列会原样打印成 `←[2m` 一类的乱码。这里尝试打开它，
+/// 打不开就当作"这个终端不能绘制"，退回到只打印汇总（与 stderr 被重定向时一致），
+/// 而不是把转义序列写进用户的眼睛。
+///
+/// 只声明用到的三个函数，不为此引入 `windows-sys` 依赖。
+#[cfg(windows)]
+fn ansi_supported() -> bool {
+    // 手写声明：链接 kernel32，用 `link_name` 保留原名，避免非 snake_case 的警告。
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "GetStdHandle"]
+        fn get_std_handle(which: u32) -> isize;
+        #[link_name = "GetConsoleMode"]
+        fn get_console_mode(handle: isize, mode: *mut u32) -> i32;
+        #[link_name = "SetConsoleMode"]
+        fn set_console_mode(handle: isize, mode: u32) -> i32;
+    }
+    // `STD_ERROR_HANDLE` 是 -12，按无符号位模式写成常量；`INVALID_HANDLE_VALUE` 是 -1。
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    // `ENABLE_VIRTUAL_TERMINAL_PROCESSING` 让控制台解释 ANSI 转义序列。
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    // 安全性：三个函数只接收句柄与整数/指针参数，`mode` 指向本栈帧里可写的 `u32`，
+    // 失败时返回 0，没有需要释放的资源。
+    unsafe {
+        let handle = get_std_handle(STD_ERROR_HANDLE);
+        // 句柄 0 与 -1 都不是可用的控制台句柄（例如 stderr 被重定向到文件）。
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode: u32 = 0;
+        if get_console_mode(handle, &mut mode) == 0 {
+            return false;
+        }
+        // 已经开启就直接返回成功，不必重复设置。
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true;
+        }
+        // 设置失败说明这个控制台不支持（例如被重定向到 ConPTY 之外的设备）。
+        set_console_mode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+/// 非 Windows 平台的终端一律支持 ANSI 转义序列。
+#[cfg(not(windows))]
+fn ansi_supported() -> bool {
+    true
 }
 
 /// 颜色策略：显式开关优先，其次看 NO_COLOR、TERM=dumb 和是否为终端。

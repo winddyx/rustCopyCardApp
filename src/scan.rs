@@ -361,9 +361,17 @@ mod tests {
         assert_eq!(manifest.total_bytes, 6);
         assert!(manifest.errors.is_empty());
         // 清单按路径排序，所以断言可以直接写出期望顺序。
-        // `map` 把 `&Entry` 转成 `String`，`collect()` 的目标类型由左边的类型标注推断。
-        let rels: Vec<String> = manifest.files.iter().map(|f| f.rel.display()).collect();
-        assert_eq!(rels, vec!["a/b/c.MOV".to_string(), "top.txt".to_string()]);
+        // 期望值用 `PathBuf` 而不是 `display()` 的字符串：`Path` 的比较按路径片段进行，
+        // Windows 上的 `a\b\c.MOV` 与 `a/b/c.MOV` 因此相等，断言不必跟着平台换分隔符。
+        let rels: Vec<PathBuf> = manifest
+            .files
+            .iter()
+            .map(|f| f.rel.as_path().to_path_buf())
+            .collect();
+        assert_eq!(
+            rels,
+            vec![PathBuf::from("a/b/c.MOV"), PathBuf::from("top.txt")]
+        );
     }
 
     #[test]

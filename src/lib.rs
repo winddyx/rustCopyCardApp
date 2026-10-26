@@ -19,6 +19,8 @@
 
 /// 命令行参数解析。用 clap 的 derive 方式，结构体字段即选项。
 pub mod cli;
+/// 输出设备准备：Windows 控制台的 UTF-8 代码页切换与恢复。
+pub mod console;
 /// 复制阶段。把选项映射到内嵌 sy 引擎的配置，自己不动字节。
 pub mod engine;
 /// 错误类型与退出码映射。

@@ -139,6 +139,79 @@ pub fn looks_like_tmp(name: &std::ffi::OsStr) -> bool {
         || (s.starts_with('.') && s.ends_with(".rcptmp") && s.len() > ".rcptmp".len() + 1)
 }
 
+/// 把 Windows 规范路径上的 `\\?\`（以及 `\\?\UNC\`）前缀去掉。
+///
+/// `fs::canonicalize` 在 Windows 上总是返回带 `\\?\` 前缀的路径：这个前缀让系统跳过
+/// 260 字符的路径规范化和名字清理，是给 API 用的写法，不是给用户看的。原样打印出来
+/// 只会让 `SRC` / `DST` 两行、错误提示里的路径都多出一段无意义的字符，所以路径在进入
+/// 后续流程之前先还原成普通写法。其他平台（以及不带该前缀的路径）原样返回。
+///
+/// 去掉前缀不会让原本可用的路径变成超长路径：清单里的每一个条目都已经由
+/// `path_problems` 按平台的 `path_limit()` 检查过。
+pub fn strip_verbatim(path: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        // 前缀是 `Component::Prefix` 的一个变体；只有 `Verbatim*` 两类需要改写。
+        use std::path::Prefix;
+
+        // 逐个取片段：先拿走第一个前缀片段，剩下的按顺序拼回普通路径。
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return path.to_path_buf();
+        };
+        // 尾随空格或点只有在 verbatim 路径里才是名字的一部分，普通 Win32 路径会把它们
+        // 裁掉。这样的路径一旦去掉前缀就指向另一个文件，因此保持原样。
+        if components.clone().any(is_verbatim_only_name) {
+            return path.to_path_buf();
+        }
+        match prefix.kind() {
+            // `\\?\C:\card\a` 还原成 `C:\card\a`。
+            Prefix::VerbatimDisk(letter) => {
+                // `C:` 后面必须紧跟分隔符，否则会变成"驱动器相对路径"（`C:a`）。
+                let mut out = PathBuf::from(format!("{}:\\", letter as char));
+                for comp in components {
+                    out.push(comp.as_os_str());
+                }
+                out
+            }
+            // `\\?\UNC\server\share\a` 还原成 `\\server\share\a`。
+            Prefix::VerbatimUNC(server, share) => {
+                let mut out = PathBuf::from(r"\\");
+                out.push(server);
+                out.push(share);
+                for comp in components {
+                    out.push(comp.as_os_str());
+                }
+                out
+            }
+            // 其余前缀不在 canonicalize 的输出范围内，保持原样，避免猜错。
+            _ => path.to_path_buf(),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 非 Windows 平台没有这种前缀，统一返回一份可拥有的副本。
+        let _ = path;
+        path.to_path_buf()
+    }
+}
+
+/// 该路径片段是否只有 verbatim 路径才能表达（尾随空格或点）。
+///
+/// 普通 Win32 路径在规范化时会把文件名末尾的空格与点裁掉，因此 `a.` 与 `a` 是同一个
+/// 文件；verbatim 路径则按字面处理。去掉 `\\?\` 前缀会改变这种路径的含义。
+#[cfg(target_os = "windows")]
+fn is_verbatim_only_name(comp: Component<'_>) -> bool {
+    match comp {
+        Component::Normal(name) => {
+            let s = name.to_string_lossy();
+            s.ends_with(' ') || s.ends_with('.')
+        }
+        // 根目录与 `..` 等片段不受这条规则影响。
+        _ => false,
+    }
+}
+
 /// 目标根目录是否等于源根目录、位于源内部，或者反过来。两个路径必须已经规范化。
 ///
 /// `Path::starts_with` 是按路径片段比较而不是按字符串前缀比较：`/card2` 不以
@@ -168,12 +241,32 @@ pub fn nesting_problem(source: &Path, target: &Path) -> Option<String> {
     None
 }
 
+/// 一段路径在平台上的长度，用于与文件系统的限制比较。
+///
+/// 两个平台的口径本来不同：Unix 以字节计（`NAME_MAX` 255 字节、`PATH_MAX` 4096 字节），
+/// Windows 以字符计（`MAX_PATH` 260 个 UTF-16 码元，单段 255 个）。`OsStr::len()` 在
+/// Windows 上返回的是 WTF-8 字节数，一个汉字会被算成 3，于是完全合法的中文路径
+/// （90 个汉字的文件名）会被误判为超长；`encode_wide().count()` 才是 Windows 认的口径。
+fn os_len(s: &std::ffi::OsStr) -> usize {
+    #[cfg(target_os = "windows")]
+    {
+        // `encode_wide` 产出 UTF-16 码元序列，长度即 Windows 计数的单位。
+        use std::os::windows::ffi::OsStrExt;
+        s.encode_wide().count()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Unix 的限制以字节计，`OsStr::len()` 正是字节数。
+        s.len()
+    }
+}
+
 /// 检查目标根目录加相对路径是否超过平台的路径总长或单段长度限制。
 ///
-/// `as_os_str().len()` 取的是字节长度而不是字符数，这与各平台文件系统的限制口径一致。
+/// 长度按平台自己的口径计算（见 `os_len`），不按 UTF-8 字节。
 pub fn path_problems(rel: &Path, target_root: &Path) -> Option<String> {
-    // 总长 = 目标根 + 分隔符(1 字节) + 相对路径；这里按最坏情况估算，宁可保守。
-    let total = target_root.as_os_str().len() + 1 + rel.as_os_str().len();
+    // 总长 = 目标根 + 分隔符(1) + 相对路径；分隔符在两种口径下都算 1。
+    let total = os_len(target_root.as_os_str()) + 1 + os_len(rel.as_os_str());
     if total > path_limit() {
         return Some(format!(
             "path length {} exceeds the platform limit {}: {}",
@@ -183,9 +276,9 @@ pub fn path_problems(rel: &Path, target_root: &Path) -> Option<String> {
             target_root.join(rel).display()
         ));
     }
-    // 单独检查每一段的长度：多数文件系统单段上限是 255 字节。
+    // 单独检查每一段的长度：多数文件系统单段上限是 255。
     for comp in rel.components() {
-        let len = comp.as_os_str().len();
+        let len = os_len(comp.as_os_str());
         if len > 255 {
             return Some(format!(
                 "file name component length {} exceeds 255: {}",
@@ -199,6 +292,8 @@ pub fn path_problems(rel: &Path, target_root: &Path) -> Option<String> {
 }
 
 /// 各平台的路径长度上限。
+///
+/// 返回值的单位与 `os_len` 一致：Unix 是字节，Windows 是 UTF-16 码元。
 ///
 /// 同一个函数名写了三份定义，靠 `#[cfg(target_os = ...)]` 在编译期只保留一份：
 /// 这是条件编译，不是运行时分支，未选中的代码根本不会被编译进二进制。
@@ -304,6 +399,68 @@ mod tests {
         assert!(nesting_problem(Path::new("/data/card/sub"), s).is_some());
         // 平级目录是合法布局：返回 `None`。
         assert!(nesting_problem(s, Path::new("/out/copy")).is_none());
+    }
+
+    // Windows 上的 `fs::canonicalize` 一定返回带 `\\?\` 前缀的路径。这里用字面量验证
+    // 前缀被正确还原：盘符路径、UNC 路径，以及本来就没有前缀的路径。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn verbatim_prefix_is_removed() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\card\100MEDIA\A001.MOV")),
+            PathBuf::from(r"C:\card\100MEDIA\A001.MOV")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\server\share\card\a.bin")),
+            PathBuf::from(r"\\server\share\card\a.bin")
+        );
+        // 没有前缀的路径原样返回，不能因为"没有可剥的东西"而丢掉片段。
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\card")),
+            PathBuf::from(r"C:\card")
+        );
+        // 尾随空格或点只有 verbatim 路径才表达得出，去掉前缀会让路径指向另一个文件，
+        // 因此这类路径必须原样保留。
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\card\name.")),
+            PathBuf::from(r"\\?\C:\card\name.")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\card\name ")),
+            PathBuf::from(r"\\?\C:\card\name ")
+        );
+    }
+
+    // 长度限制必须按平台自己的计数单位判断：同一个 90 汉字的文件名在 Windows 上
+    // 是 90 个 UTF-16 码元（合法），在 Unix 上是 270 字节（超过单段 255）。
+    #[test]
+    fn component_limit_follows_the_platform_unit() {
+        let name = format!("{}.JPG", "照".repeat(90));
+        let rel = Path::new(&name);
+        let root = Path::new("/t");
+        #[cfg(target_os = "windows")]
+        {
+            // Windows 按 UTF-16 码元计：94 个码元，远低于 255。
+            assert!(path_problems(rel, root).is_none());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Unix 按字节计：270 字节超过 255。
+            assert!(path_problems(rel, root).is_some());
+        }
+    }
+
+    // 总长限制同样按平台单位：Windows 的 259 是字符数而不是字节数。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn total_limit_counts_utf16_units_on_windows() {
+        // 目标根 "C:\" 加 38 个字符，加分隔符，加 100 个汉字 = 141 个码元。
+        let root = format!("C:\\{}", "r".repeat(38));
+        let rel = "照".repeat(100);
+        assert!(path_problems(Path::new(&rel), Path::new(&root)).is_none());
+        // 300 个汉字仍然超过 Windows 的 259 上限，必须被拒绝。
+        let too_long = "照".repeat(300);
+        assert!(path_problems(Path::new(&too_long), Path::new(&root)).is_some());
     }
 
     #[test]

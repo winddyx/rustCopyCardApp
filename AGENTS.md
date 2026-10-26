@@ -71,8 +71,20 @@
   target-specific feature in `Cargo.toml` (`sy`'s `ssh` feature pulls openssl-sys).
   armv7 additionally links an empty `libatomic.a` (ARMv7 has native 64-bit atomics) that
   the recipe creates under `target/armv7-support`.
-- `make test` (`cargo test`): 63 unit tests in `src/`, 34 integration tests in `tests/`
-  (`cli_flow.rs`, `failure_paths.rs`).
+- `make test` (`cargo test`): 64 unit tests in `src/`, 36 integration tests in `tests/`
+  (`cli_flow.rs`, `failure_paths.rs`). On Windows the Unix-only cases are compiled out, so
+  that run has 64 unit tests and 24 integration tests.
+- Native Windows build and test (no `make`): `rustup toolchain install
+  stable-x86_64-pc-windows-gnu` plus a mingw-w64 on `PATH` (WinLibs via winget), then
+  `rustup run stable-x86_64-pc-windows-gnu cargo test`. The host toolchain must be the GNU
+  one: build scripts and proc macros are host code, so an msvc host still needs
+  `link.exe` even when the target is GNU.
+- `make win-dist` is the Windows-host counterpart of `dist`: it wipes `dist/` and builds
+  only `rcca-windows-x64.exe`, `rcca-windows-x64-upx.exe` and a two-entry `SHA256SUMS`
+  (`win-checksums`). `dist` itself stays unchanged — the macOS artifact needs the Apple
+  SDK and the musl ones need `zig`, neither exists on a Windows host. Invoke it from Git
+  Bash with `RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu` and `SHA256=sha256sum`
+  (`make` is not present; use `mingw32-make`).
 - `make lint`: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
 
 ## Invariants
@@ -122,6 +134,8 @@
   column 8, over-long names are truncated from the start so the extension survives.
 - stdout carries the summary only, so `rcca source target > log` is clean text. Without a
   TTY on stderr or with `--quiet`, nothing is drawn, no thread starts, stderr is empty.
+  `ui::interactive` also asks `ui::ansi_supported`, so a Windows console that refuses
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` gets no line either instead of raw escape codes.
 - The failure count in the result line comes from `Stats::failure_count()`, not from the
   length of the example list: the store is bounded (32 examples, 64 KiB), the count is
   not. `--verbose` raises both bounds so its list is complete. Failure text is flattened
@@ -145,6 +159,17 @@
 - `fs_type_name` / `free_space` return `None` where rcca has no implementation (the current
   Windows build). Both volume guards (4 GiB on FAT, free space) are then skipped, and a
   stderr warning says so; never make them fail silently.
+- Windows paths and the console are handled in one place each. `paths::strip_verbatim` is
+  applied to `canonicalize` output before anything is printed, so `SRC`/`DST`, the
+  preflight messages and sy's per-file errors all show `C:\...` instead of `\\?\C:\...`.
+  `paths::os_len` counts the way the platform counts (UTF-16 code units on Windows, bytes
+  elsewhere) and is what `path_problems` uses; `OsStr::len()` there would reject legal
+  names — 90 CJK characters are 90 units but 270 bytes. `console::use_utf8` switches the
+  console output code page to UTF-8 for the run and `console::restore` puts the original
+  back on both exits (the normal one and the second Ctrl-C), because that code page is
+  global state of the window. `ui::ansi_supported` turns drawing off when the console
+  refuses `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, so no raw escape sequences are ever
+  printed. `--verify-no-cache` warns when `verify::no_cache_supported()` is false.
 
 ## Definition of done
 
